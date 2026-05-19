@@ -27,6 +27,12 @@ herdr --default-config > ~/.config/herdr/config.toml
 
 If a config value is invalid, Herdr falls back to a safe default and shows a startup warning.
 
+Herdr shows first-run notification setup when `onboarding` is missing or true. Set it when you want to skip that flow after choosing your notification settings.
+
+```toml
+onboarding = false
+```
+
 ## Reload config
 
 Reload a running server after editing `config.toml`:
@@ -69,8 +75,12 @@ reload_config = "R"
 open_notification_target = "o"
 previous_workspace = "H"
 next_workspace = "L"
+previous_agent = "A"
+next_agent = "D"
 previous_tab = "J"
 next_tab = "K"
+rename_tab = "T"
+close_tab = "W"
 rename_pane = "p"
 edit_scrollback = "e"
 focus_pane_left = "h"
@@ -80,6 +90,8 @@ focus_pane_right = "l"
 ```
 
 Use the full default config to see every available action.
+
+Key strings accept plain keys, modifier combinations such as `ctrl+a`, `shift+n`, `alt+1`, `cmd+k`, and special keys such as `enter`, `tab`, `esc`, `left`, `right`, `up`, and `down`. Plain keys, `ctrl+letter`, Escape, Tab, Enter, and function keys are the most reliable. Alt, Cmd/Super, and punctuation with modifiers depend on your terminal and tmux settings.
 
 ## Indexed jumps
 
@@ -108,6 +120,8 @@ command = "lazygit"
 `type = "pane"` opens a temporary pane and closes it when the command exits.
 
 `type = "shell"` runs detached in the background.
+
+Custom commands receive `HERDR_SOCKET_PATH`, `HERDR_BIN_PATH`, `HERDR_ACTIVE_WORKSPACE_ID`, `HERDR_ACTIVE_TAB_ID`, `HERDR_ACTIVE_PANE_ID`, and `HERDR_ACTIVE_PANE_CWD` when those values are available. Shell commands run from the focused pane's working directory when Herdr can detect it.
 
 ## Theme
 
@@ -161,31 +175,62 @@ accent = "cyan"
 
 `agent_panel_scope` can be `all` or `current`. Use `current` if you only want the agent panel to show agents in the active workspace.
 
+`confirm_close` controls whether closing a workspace asks for confirmation. `prompt_new_tab_name` controls whether new tabs ask for a label first.
+
 Set `mouse_capture = false` if you want your terminal to handle normal clicks, such as command-clicking URLs.
 
 Set `show_agent_labels_on_pane_borders = true` if you want detected agent labels in split pane borders when no manual pane label is set.
 
 ## Notifications
 
-Herdr can show toast notifications when agents finish or need input.
+Herdr can show popup notifications when agents finish or need input.
 
 ```toml
 [ui.toast]
-delivery = "auto"
+delivery = "off"
 ```
 
-On macOS, Herdr can use system notifications when supported by the foreground client.
+`delivery = "off"` disables popup notifications. This is the default.
+
+`delivery = "herdr"` shows a top-right toast inside the Herdr UI. Click the toast, or bind `keys.open_notification_target`, to focus the target workspace, tab, and pane.
+
+`delivery = "terminal"` asks the outer terminal to show a desktop notification. Herdr sends terminal notification escape sequences for Ghostty, iTerm2, Kitty, and WezTerm. This is useful over SSH because the local terminal owns the notification.
+
+`delivery = "system"` asks the local operating system directly. On macOS, Herdr uses `terminal-notifier` when available, then falls back to `/usr/bin/osascript`. `terminal-notifier` can activate the hosting terminal when you click the notification. On Linux, Herdr uses `notify-send` and requires `DISPLAY` or `WAYLAND_DISPLAY`.
+
+Popup notifications are for background attention. Herdr suppresses popups for the active tab.
 
 ## Sound
 
-Sound is optional and server-owned.
+Sound notifications are enabled by default and are played by the local Herdr client.
 
 ```toml
 [ui.sound]
-enabled = false
+enabled = true
 ```
 
-Keep sound off on shared machines or remote servers unless you explicitly want it.
+Herdr plays a done sound when an agent finishes and an attention sound when an agent needs input. Set `enabled = false` on shared machines or remote servers unless you explicitly want audio.
+
+On macOS, Herdr uses `afplay`. On Linux, Herdr tries `paplay`, then `aplay`. If no player is available, sound playback is skipped and Herdr logs a warning.
+
+Custom sounds must be mp3 files. Relative paths are resolved from the config file's directory.
+
+```toml
+[ui.sound]
+path = "sounds/notification.mp3"
+done_path = "sounds/done.mp3"
+request_path = "sounds/request.mp3"
+```
+
+`path` sets one sound for all sound notifications. `done_path` and `request_path` override only the finished and needs-input sounds.
+
+Per-agent sound overrides accept `default`, `on`, or `off`. Droid is muted by default.
+
+```toml
+[ui.sound.agents]
+droid = "off"
+claude = "on"
+```
 
 ## Scrollback
 
@@ -228,6 +273,7 @@ Leave this off unless you are testing terminal image behavior.
 | `HERDR_SESSION` | Select a named session for CLI commands. |
 | `HERDR_SOCKET_PATH` | Low-level socket path override. |
 | `HERDR_LOG` | Set log filtering, for example `HERDR_LOG=herdr=debug`. |
+| `HERDR_DISABLE_SOUND` | Disable sound playback even when `[ui.sound] enabled = true`. |
 
 ## Logs
 

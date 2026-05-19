@@ -15,6 +15,7 @@ herdr --session work          # launch or attach to a named session
 herdr --remote workbox        # attach through SSH
 herdr --no-session            # single-process escape hatch
 herdr --default-config        # print default config
+herdr update                  # download and install the latest version
 herdr --version               # print version
 ```
 
@@ -29,11 +30,12 @@ herdr status client
 ## Server
 
 ```bash
+herdr server
 herdr server stop
 herdr server reload-config
 ```
 
-`reload-config` applies reloadable settings without restarting panes.
+`herdr server` runs the headless server explicitly. Use it for supervised or service-style setups. `reload-config` applies reloadable settings without restarting panes.
 
 ## Sessions
 
@@ -190,3 +192,4 @@ herdr integration status [--outdated-only]
 | `HERDR_SESSION` | Select a named session for CLI commands. |
 | `HERDR_SOCKET_PATH` | Low-level socket path override. |
 | `HERDR_LOG` | Set log filter, for example `HERDR_LOG=herdr=debug`. |
+| `HERDR_DISABLE_SOUND` | Disable sound playback even when sound notifications are enabled. |

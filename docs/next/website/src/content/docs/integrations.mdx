@@ -53,7 +53,7 @@ Herdr writes the bundled extension to:
 ~/.pi/agent/extensions/herdr-agent-state.ts
 ```
 
-If `PI_CODING_AGENT_DIR` is set, Herdr writes to that agent directory instead.
+If `PI_CODING_AGENT_DIR` is set, Herdr writes to `$PI_CODING_AGENT_DIR/extensions/herdr-agent-state.ts` instead. The extensions directory must already exist. Uninstall removes only that extension file.
 
 ## Claude Code
 
@@ -65,6 +65,8 @@ herdr integration install claude
 
 The hook reports agent state to the local Herdr socket when Claude Code exposes hook events.
 
+Herdr uses `~/.claude` by default, or `CLAUDE_CONFIG_DIR` when set. The Claude config directory must already exist. Install writes `hooks/herdr-agent-state.sh` and updates `settings.json` with Herdr hook entries. Uninstall removes the matching hook entries and deletes the hook script.
+
 ## Codex
 
 Install the Codex hook:
@@ -75,6 +77,8 @@ herdr integration install codex
 
 Codex state is reported through the same local socket API used by other integrations.
 
+Herdr uses `~/.codex` by default, or `CODEX_HOME` when set. The Codex config directory must already exist. Install writes `herdr-agent-state.sh`, updates `hooks.json`, and ensures `[features] hooks = true` in `config.toml`. It also removes the deprecated top-level `codex_hooks` flag when present. Uninstall removes Herdr entries from `hooks.json` and deletes the hook script, but leaves `config.toml` unchanged.
+
 ## OpenCode
 
 Install the OpenCode plugin:
@@ -82,6 +86,8 @@ Install the OpenCode plugin:
 ```bash
 herdr integration install opencode
 ```
+
+Herdr writes the plugin to `~/.config/opencode/plugins/herdr-agent-state.js`. The OpenCode config directory must already exist. Uninstall removes only that plugin file.
 
 The plugin reports semantic state while OpenCode runs inside a Herdr pane.
 
@@ -93,7 +99,7 @@ Install the Hermes Agent plugin:
 herdr integration install hermes
 ```
 
-Herdr writes `~/.hermes/plugins/herdr-agent-state/` and enables `herdr-agent-state` in `~/.hermes/config.yaml`. Restart Hermes after installing so the plugin loads.
+Herdr writes `~/.hermes/plugins/herdr-agent-state/` and enables `herdr-agent-state` in `~/.hermes/config.yaml`. The Hermes config directory must already exist. Restart Hermes after installing so the plugin loads. Uninstall removes the plugin directory and removes `herdr-agent-state` from `plugins.enabled`.
 
 The plugin reports lifecycle, tool, and approval state while Hermes runs inside a Herdr pane. Native screen heuristics remain available when the plugin is not installed.
 
