@@ -125,6 +125,13 @@ export default defineConfig({
             { label: 'Agent skill file', slug: 'docs/agent-skill' },
           ],
         },
+        {
+          label: 'Updates',
+          items: [
+            { label: 'Releases', link: '/releases/' },
+            { label: 'Blog', link: '/blog/' },
+          ],
+        },
       ],
     }),
   ],

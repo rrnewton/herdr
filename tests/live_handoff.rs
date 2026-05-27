@@ -21,6 +21,11 @@ struct SpawnedHerdr {
     child: Box<dyn Child + Send + Sync>,
 }
 
+struct RequestError {
+    retryable: bool,
+    message: String,
+}
+
 impl Drop for SpawnedHerdr {
     fn drop(&mut self) {
         let pid = self.child.process_id();
@@ -162,14 +167,56 @@ fn spawn_default_session_server(config_home: &Path, runtime_dir: &Path) -> Spawn
     }
 }
 
-fn request(socket_path: &Path, request: serde_json::Value) -> serde_json::Value {
-    let mut stream = UnixStream::connect(socket_path).unwrap();
-    stream.write_all(request.to_string().as_bytes()).unwrap();
-    stream.write_all(b"\n").unwrap();
-    stream.flush().unwrap();
+fn try_request(
+    socket_path: &Path,
+    request: serde_json::Value,
+) -> Result<serde_json::Value, RequestError> {
+    let mut stream = UnixStream::connect(socket_path).map_err(|err| RequestError {
+        retryable: true,
+        message: format!("connect {}: {err}", socket_path.display()),
+    })?;
+    let request_text = request.to_string();
+    stream
+        .write_all(request_text.as_bytes())
+        .map_err(|err| RequestError {
+            retryable: true,
+            message: format!("write request to {}: {err}", socket_path.display()),
+        })?;
+    stream.write_all(b"\n").map_err(|err| RequestError {
+        retryable: true,
+        message: format!("write newline to {}: {err}", socket_path.display()),
+    })?;
+    stream.flush().map_err(|err| RequestError {
+        retryable: true,
+        message: format!("flush request to {}: {err}", socket_path.display()),
+    })?;
     let mut line = String::new();
-    BufReader::new(stream).read_line(&mut line).unwrap();
-    serde_json::from_str(&line).unwrap()
+    BufReader::new(stream)
+        .read_line(&mut line)
+        .map_err(|err| RequestError {
+            retryable: true,
+            message: format!("read response from {}: {err}", socket_path.display()),
+        })?;
+    if line.is_empty() {
+        return Err(RequestError {
+            retryable: true,
+            message: format!(
+                "empty response from {} for request {request_text}",
+                socket_path.display()
+            ),
+        });
+    }
+    serde_json::from_str(&line).map_err(|err| RequestError {
+        retryable: false,
+        message: format!(
+            "parse response from {} for request {request_text}: {err}; response was {line:?}",
+            socket_path.display()
+        ),
+    })
+}
+
+fn request(socket_path: &Path, request: serde_json::Value) -> serde_json::Value {
+    try_request(socket_path, request).unwrap_or_else(|err| panic!("{}", err.message))
 }
 
 fn assert_ok(response: serde_json::Value) {
@@ -181,19 +228,25 @@ fn assert_ok(response: serde_json::Value) {
 
 fn wait_for_api(socket_path: &Path, timeout: Duration) {
     let deadline = Instant::now() + timeout;
+    let mut last_error = String::new();
     while Instant::now() < deadline {
-        if UnixStream::connect(socket_path).is_ok() {
-            let response = request(
-                socket_path,
-                serde_json::json!({"id":"test:ping","method":"ping","params":{}}),
-            );
-            if response.get("result").is_some() {
-                return;
+        match try_request(
+            socket_path,
+            serde_json::json!({"id":"test:ping","method":"ping","params":{}}),
+        ) {
+            Ok(response) if response.get("result").is_some() => return,
+            Ok(response) => panic!("api ping returned non-success response: {response}"),
+            Err(err) if !err.retryable => panic!("{}", err.message),
+            Err(err) => {
+                last_error = err.message;
             }
         }
         thread::sleep(Duration::from_millis(25));
     }
-    panic!("api did not become ready at {}", socket_path.display());
+    panic!(
+        "api did not become ready at {}; last error: {last_error}",
+        socket_path.display()
+    );
 }
 
 fn wait_for_output(socket_path: &Path, pane_id: &str, needle: &str) {

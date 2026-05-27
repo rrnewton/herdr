@@ -48,7 +48,7 @@ const canonicalUrl = new URL(canonicalPath, 'https://herdr.dev').toString();
         document.documentElement.setAttribute("data-palette", saved || system);
       })();
     </script>
-    <link rel="stylesheet" href="/css/style.css" />
+    <link rel="stylesheet" href="/css/style.css?v=21" />
   </head>
   <body>
     <header class="site-header">
@@ -57,6 +57,24 @@ const canonicalUrl = new URL(canonicalPath, 'https://herdr.dev').toString();
           <span class="brand-logo" aria-hidden="true"></span>
           <span>herdr</span>
         </a>
+        <details class="nav-menu">
+          <summary class="nav-menu-button" aria-label="Open navigation">
+            <span></span>
+            <span></span>
+            <span></span>
+          </summary>
+          <div class="nav-menu-panel">
+            <a href="/">Home</a>
+            <a href="/compare/">Compare</a>
+            <a href="/releases/">Releases</a>
+            <a href="/blog/">Blog</a>
+            <a href="/docs/quick-start/">Quick start</a>
+            <a href="/docs/">Docs</a>
+            <a href="/docs/socket-api/">API</a>
+            <a href="/docs/install/">Install</a>
+            <a href="https://github.com/ogulcancelik/herdr">GitHub</a>
+          </div>
+        </details>
         <div class="nav-links">
           <a href="/">Home</a>
           <a href="/compare/">Compare</a>
