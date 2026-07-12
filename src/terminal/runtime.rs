@@ -237,6 +237,12 @@ impl TerminalRuntime {
         self.0.resize(rows, cols, cell_width_px, cell_height_px);
     }
 
+    /// Shared handle to this terminal's raw output replication log, used to
+    /// stream the responsive local mirror.
+    pub fn output_log(&self) -> std::sync::Arc<crate::terminal::MirrorLog> {
+        self.0.output_log()
+    }
+
     #[cfg(unix)]
     pub fn nudge_child_redraw_after_handoff(&self) {
         self.0.nudge_child_redraw_after_handoff();

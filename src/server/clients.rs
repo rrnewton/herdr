@@ -8,8 +8,18 @@ use crate::server::render_stream::ClientRenderState;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ClientConnectionMode {
     App,
-    TerminalAttach { terminal_id: String },
-    TerminalObserve { terminal_id: String },
+    TerminalAttach {
+        terminal_id: String,
+    },
+    TerminalObserve {
+        terminal_id: String,
+    },
+    /// Read-only raw-output mirror: the client maintains its own local terminal
+    /// emulator from the streamed PTY bytes (see the responsive local mirror
+    /// protocol in `src/protocol/wire.rs`).
+    TerminalMirror {
+        terminal_id: String,
+    },
 }
 
 pub(crate) type RenderTarget = (
@@ -66,6 +76,9 @@ pub(crate) struct ClientConnection {
     pub(crate) host_mouse_capture_active: Option<bool>,
     /// Temporary files staged from this client's local clipboard image pastes.
     pub(crate) staged_clipboard_files: Vec<PathBuf>,
+    /// For a `TerminalMirror` client, the highest mirror sequence already sent to
+    /// it. The server streams events with a greater sequence on each flush.
+    pub(crate) mirror_last_sent_seq: Option<u64>,
     /// Channels for sending framed ServerMessage data to the client writer thread.
     pub(crate) writer: Option<ClientWriter>,
 }
@@ -128,6 +141,7 @@ impl ClientConnection {
             pane_graphics_render_pending: false,
             host_mouse_capture_active: None,
             staged_clipboard_files: Vec::new(),
+            mirror_last_sent_seq: None,
             writer,
         }
     }

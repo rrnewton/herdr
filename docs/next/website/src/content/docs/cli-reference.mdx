@@ -281,6 +281,7 @@ Use `pane send-text`, `pane send-keys`, `pane run`, and `terminal attach` for or
 herdr terminal attach <terminal_id> [--takeover]
 herdr terminal session control <target> [--takeover] [--cols N] [--rows N]
 herdr terminal session observe <target> [--cols N] [--rows N]
+herdr terminal session mirror <target> [--resume-from SEQ] [--cols N] [--rows N]
 herdr terminal title set <title>
 herdr terminal title clear
 ```
@@ -297,6 +298,17 @@ terminal, or agent target. It prints newline-delimited JSON `terminal.frame`
 records with base64-encoded ANSI bytes, then a `terminal.closed` record when
 the server closes the stream. Multiple observers can watch the same terminal
 without taking input, resize, scroll, or takeover authority.
+`terminal session mirror` opens a read-only replication stream for a pane,
+terminal, or agent target. Unlike observe (which streams server-rendered
+frames), mirror replicates the terminal's raw PTY output plus resize events with
+durable sequence numbers, so a consumer can maintain its own terminal state
+locally and scroll, search, and select without server round-trips. It prints a
+newline-delimited JSON `mirror.snapshot` record (establishing `base_seq`, `cols`,
+`rows`), then `mirror.event` records (`output` with base64 raw bytes, or
+`resize`), and a final `mirror.closed`. Pass `--resume-from SEQ` to continue a
+previous stream after a disconnect: the server replays events after `SEQ`, or
+sends a fresh snapshot if that point is no longer retained. Multiple mirror
+clients can watch the same terminal.
 `terminal title clear` restores Herdr's default outer terminal window title.
 
 ## Waits

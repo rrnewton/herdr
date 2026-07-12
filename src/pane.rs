@@ -935,6 +935,10 @@ pub struct PaneRuntime {
     child_wait_completed: Option<Arc<AtomicBool>>,
     kitty_keyboard_flags: Arc<AtomicU16>,
     detection_content_seq: Arc<AtomicU64>,
+    /// Raw child PTY output + resize replication log for the responsive local
+    /// mirror. Recorded on the PTY read path; read by the server to stream to
+    /// mirror clients.
+    output_log: Arc<crate::terminal::MirrorLog>,
     full_lifecycle_authority_active: Arc<AtomicBool>,
     detect_reset_notify: Arc<Notify>,
     pending_release: Arc<Mutex<Option<PendingAgentRelease>>>,
@@ -1410,6 +1414,24 @@ fn usable_reported_cwd(cwd: std::path::PathBuf) -> Option<std::path::PathBuf> {
     (cwd.is_absolute() && cwd.is_dir()).then_some(cwd)
 }
 
+/// Records raw child PTY output into the terminal's mirror log and, when a
+/// mirror client is attached, wakes the server event loop so the new output is
+/// streamed promptly — even for output the terminal emulator did not consider
+/// render-worthy.
+fn record_mirror_output(
+    bytes: &[u8],
+    output_log: &Arc<crate::terminal::MirrorLog>,
+    render_notify: &Arc<Notify>,
+) {
+    if bytes.is_empty() {
+        return;
+    }
+    output_log.record_output(bytes);
+    if output_log.has_subscribers() {
+        render_notify.notify_one();
+    }
+}
+
 fn publish_reported_cwd(
     pane_id: PaneId,
     cwd: std::path::PathBuf,
@@ -1743,6 +1765,7 @@ impl PaneRuntime {
         let reported_cwd = Arc::new(Mutex::new(None));
         let kitty_keyboard_flags = Arc::new(AtomicU16::new(keyboard_protocol_flags));
         let detection_content_seq = Arc::new(AtomicU64::new(0));
+        let output_log = Arc::new(crate::terminal::MirrorLog::new(cols, rows));
 
         let io = {
             let terminal = terminal.clone();
@@ -1750,6 +1773,7 @@ impl PaneRuntime {
             let render_notify = render_notify.clone();
             let render_dirty = render_dirty.clone();
             let detection_content_seq = detection_content_seq.clone();
+            let output_log = output_log.clone();
             let child_pid = child_pid.clone();
             let read_events = events.clone();
             let reported_cwd = reported_cwd.clone();
@@ -1760,6 +1784,7 @@ impl PaneRuntime {
                 let result =
                     terminal.process_pty_bytes(pane_id, shell_pid, bytes, &response_writer);
                 observe_detection_content_change(bytes, &detection_content_seq);
+                record_mirror_output(bytes, &output_log, &render_notify);
                 if result.request_render && !render_dirty.swap(true, Ordering::AcqRel) {
                     render_notify.notify_one();
                 }
@@ -1823,6 +1848,7 @@ impl PaneRuntime {
             child_wait_completed: None,
             kitty_keyboard_flags,
             detection_content_seq,
+            output_log,
             full_lifecycle_authority_active,
             detect_reset_notify,
             pending_release,
@@ -1879,6 +1905,7 @@ impl PaneRuntime {
         let reported_cwd = Arc::new(Mutex::new(None));
         let child_wait_completed = Arc::new(AtomicBool::new(false));
         let detection_content_seq = Arc::new(AtomicU64::new(0));
+        let output_log = Arc::new(crate::terminal::MirrorLog::new(cols, rows));
         let full_lifecycle_authority_active = Arc::new(AtomicBool::new(false));
         {
             let child_pid = child_pid.clone();
@@ -1912,6 +1939,7 @@ impl PaneRuntime {
             let render_notify = render_notify.clone();
             let render_dirty = render_dirty.clone();
             let detection_content_seq = detection_content_seq.clone();
+            let output_log = output_log.clone();
             let child_pid = child_pid.clone();
             let events = events.clone();
             let reported_cwd = reported_cwd.clone();
@@ -1923,6 +1951,7 @@ impl PaneRuntime {
                 if agent_detection == AgentDetection::Enabled {
                     observe_detection_content_change(bytes, &detection_content_seq);
                 }
+                record_mirror_output(bytes, &output_log, &render_notify);
                 if result.request_render && !render_dirty.swap(true, Ordering::AcqRel) {
                     render_notify.notify_one();
                 }
@@ -2344,6 +2373,7 @@ impl PaneRuntime {
             child_wait_completed: Some(child_wait_completed),
             kitty_keyboard_flags,
             detection_content_seq,
+            output_log,
             full_lifecycle_authority_active,
             detect_reset_notify,
             pending_release,
@@ -2399,6 +2429,7 @@ impl PaneRuntime {
             return;
         }
         self.current_size.set(size);
+        self.output_log.record_resize(cols, rows);
         let terminal_responses = self
             .terminal
             .resize(rows, cols, cell_width_px, cell_height_px);
@@ -2410,6 +2441,12 @@ impl PaneRuntime {
             cell_height_px,
             terminal_responses,
         );
+    }
+
+    /// Shared handle to this terminal's raw output replication log, used by the
+    /// server to stream the responsive local mirror.
+    pub fn output_log(&self) -> Arc<crate::terminal::MirrorLog> {
+        self.output_log.clone()
     }
 
     #[cfg(unix)]
@@ -2801,6 +2838,7 @@ impl PaneRuntime {
                 child_wait_completed: None,
                 kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
                 detection_content_seq: Arc::new(AtomicU64::new(0)),
+                output_log: Arc::new(crate::terminal::MirrorLog::new(cols, rows)),
                 full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
                 detect_reset_notify: Arc::new(Notify::new()),
                 pending_release: Arc::new(Mutex::new(None)),
@@ -3263,6 +3301,7 @@ mod tests {
             child_wait_completed: None,
             kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
             detection_content_seq: Arc::new(AtomicU64::new(0)),
+            output_log: Arc::new(crate::terminal::MirrorLog::new(80, 24)),
             full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
             detect_reset_notify: Arc::new(Notify::new()),
             pending_release: Arc::new(Mutex::new(None)),
@@ -3294,6 +3333,7 @@ mod tests {
             child_wait_completed: None,
             kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
             detection_content_seq: Arc::new(AtomicU64::new(0)),
+            output_log: Arc::new(crate::terminal::MirrorLog::new(80, 24)),
             full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
             detect_reset_notify: Arc::new(Notify::new()),
             pending_release: Arc::new(Mutex::new(None)),

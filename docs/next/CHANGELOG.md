@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Added
+- Added `herdr terminal session mirror <target>` for a responsive local mirror: instead of streaming server-rendered frames, it replicates a terminal's raw PTY output plus resize events with durable sequence numbers, so a consumer can maintain terminal state locally and scroll, search, and select without server round-trips. Supports `--resume-from SEQ` for gap-free reconnect over unreliable links. Emits newline-delimited JSON (`mirror.snapshot`, `mirror.event`, `mirror.closed`).
+
+### Changed
+- Bumped the client/server protocol version to 17 for the terminal mirror stream.
+
 ## [0.7.4] - 2026-07-15
 
 ### Added

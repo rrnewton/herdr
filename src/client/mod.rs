@@ -854,6 +854,31 @@ pub fn run_terminal_session_observe(target: String, cols: u16, rows: u16) -> io:
     write_terminal_session_output(stream)
 }
 
+/// Runs a read-only terminal mirror consumer and prints one JSON envelope per
+/// mirror message (snapshot, output/resize event, or close).
+///
+/// This is the headless/machine-readable face of the responsive local mirror:
+/// it lets tools and tests consume the raw replication stream without a live
+/// TUI. A future interactive client will instead feed these events into a local
+/// terminal emulator.
+pub fn run_terminal_session_mirror(
+    target: String,
+    cols: u16,
+    rows: u16,
+    resume_from: Option<u64>,
+) -> io::Result<()> {
+    let mut stream =
+        connect_terminal_session_stream(target.clone(), cols, rows, "mirroring terminal session")?;
+    write_to_server(
+        &mut stream,
+        &ClientMessage::MirrorTerminal {
+            target,
+            resume_from,
+        },
+    )?;
+    write_terminal_mirror_output(stream)
+}
+
 /// Runs a writable terminal session controller.
 pub fn run_terminal_session_control(
     target: String,
@@ -977,6 +1002,70 @@ fn write_terminal_session_output(mut stream: LocalStream) -> io::Result<()> {
                 return Ok(());
             }
             Ok(ServerMessage::Graphics { .. }) => {}
+            Ok(_) => {}
+            Err(protocol::FramingError::UnexpectedEof) => return Ok(()),
+            Err(err) => return Err(io::Error::other(err.to_string())),
+        }
+    }
+}
+
+fn write_terminal_mirror_output(mut stream: LocalStream) -> io::Result<()> {
+    use crate::protocol::MirrorEventKind;
+    let mut stdout = io::stdout().lock();
+    let mut emit = |value: &serde_json::Value| -> io::Result<()> {
+        serde_json::to_writer(&mut stdout, value)?;
+        stdout.write_all(b"\n")?;
+        stdout.flush()
+    };
+    loop {
+        match protocol::read_message(&mut stream, MAX_GRAPHICS_FRAME_SIZE) {
+            Ok(ServerMessage::MirrorSnapshot {
+                base_seq,
+                cols,
+                rows,
+            }) => {
+                emit(&serde_json::json!({
+                    "type": "mirror.snapshot",
+                    "base_seq": base_seq,
+                    "cols": cols,
+                    "rows": rows,
+                }))?;
+            }
+            Ok(ServerMessage::MirrorEvent { seq, kind }) => match kind {
+                MirrorEventKind::Output(bytes) => {
+                    let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                    emit(&serde_json::json!({
+                        "type": "mirror.event",
+                        "event": "output",
+                        "seq": seq,
+                        "bytes": encoded,
+                    }))?;
+                }
+                MirrorEventKind::Resize { cols, rows } => {
+                    emit(&serde_json::json!({
+                        "type": "mirror.event",
+                        "event": "resize",
+                        "seq": seq,
+                        "cols": cols,
+                        "rows": rows,
+                    }))?;
+                }
+                MirrorEventKind::Closed { reason } => {
+                    emit(&serde_json::json!({
+                        "type": "mirror.closed",
+                        "seq": seq,
+                        "reason": reason,
+                    }))?;
+                    return Ok(());
+                }
+            },
+            Ok(ServerMessage::ServerShutdown { reason }) => {
+                emit(&serde_json::json!({
+                    "type": "mirror.closed",
+                    "reason": reason,
+                }))?;
+                return Ok(());
+            }
             Ok(_) => {}
             Err(protocol::FramingError::UnexpectedEof) => return Ok(()),
             Err(err) => return Err(io::Error::other(err.to_string())),
@@ -1590,6 +1679,9 @@ async fn run_client_loop(
                 }
                 ServerMessage::Welcome { .. } => {
                     debug!("received unexpected Welcome in main loop");
+                }
+                ServerMessage::MirrorSnapshot { .. } | ServerMessage::MirrorEvent { .. } => {
+                    debug!("received unexpected mirror message in app client loop");
                 }
             },
             ClientLoopEvent::ServerDisconnected => {

@@ -235,6 +235,11 @@ const SHUTDOWN_API_TIMEOUT: Duration = Duration::from_secs(5);
 /// avoid reintroducing the idle CPU spin.
 const CLIENT_ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
+/// Coarse per-client backpressure bound for the terminal mirror stream: when a
+/// mirror client's queued control bytes exceed this, the server stops feeding it
+/// until it drains, rather than growing memory without bound for a slow reader.
+const MIRROR_MAX_CLIENT_BACKLOG_BYTES: usize = 8 * 1024 * 1024;
+
 // ---------------------------------------------------------------------------
 // Headless server
 // ---------------------------------------------------------------------------
@@ -616,7 +621,12 @@ impl HeadlessServer {
 
             self.app.sync_headless_animation_timer(now);
 
-            // 7. Render virtually and stream frames.
+            // 7. Stream raw terminal output to any mirror clients. Independent of
+            // the render gate below so mirror bytes flow promptly and are not
+            // subject to render throttling.
+            self.stream_mirror_updates();
+
+            // 8. Render virtually and stream frames.
             if needs_render && self.app.can_render_now(now) {
                 crate::render_prof::event("render.attempt");
                 let pty_dirty = self.app.render_dirty.swap(false, Ordering::AcqRel);
@@ -1401,14 +1411,22 @@ impl HeadlessServer {
         let removed = self.clients.remove(&client_id);
         if let Some(removed) = removed {
             crate::server::clipboard_image::remove_files(removed.staged_clipboard_files);
-            if let ClientConnectionMode::TerminalAttach { terminal_id } = removed.mode {
-                self.terminal_attach_owners.remove(&terminal_id);
-                if let Some(terminal_id) = self.terminal_id_by_string(&terminal_id) {
-                    self.app
-                        .state
-                        .direct_attach_resize_locks
-                        .remove(&terminal_id);
+            match &removed.mode {
+                ClientConnectionMode::TerminalAttach { terminal_id } => {
+                    self.terminal_attach_owners.remove(terminal_id);
+                    if let Some(terminal_id) = self.terminal_id_by_string(terminal_id) {
+                        self.app
+                            .state
+                            .direct_attach_resize_locks
+                            .remove(&terminal_id);
+                    }
                 }
+                ClientConnectionMode::TerminalMirror { terminal_id } => {
+                    if let Some(runtime) = self.runtime_for_terminal_id_string(terminal_id) {
+                        runtime.output_log().remove_subscriber();
+                    }
+                }
+                ClientConnectionMode::App | ClientConnectionMode::TerminalObserve { .. } => {}
             }
         }
         if was_foreground {
@@ -1691,6 +1709,169 @@ impl HeadlessServer {
         };
 
         self.attach_terminal_client(client_id, terminal_id, takeover)
+    }
+
+    /// Switches a pending client into read-only raw-output mirror mode for one
+    /// terminal, registers it on that terminal's replication log, and streams the
+    /// initial snapshot/resume batch. Subsequent output is tailed by
+    /// [`Self::stream_mirror_updates`].
+    fn mirror_terminal_client(
+        &mut self,
+        client_id: u64,
+        target: String,
+        resume_from: Option<u64>,
+    ) -> bool {
+        let Some(terminal_id) = self.resolve_terminal_session_target(client_id, &target, "mirror")
+        else {
+            return false;
+        };
+
+        let Some(output_log) = self
+            .runtime_for_terminal_id_string(&terminal_id)
+            .map(|runtime| runtime.output_log())
+        else {
+            self.send_to_client(
+                client_id,
+                ServerMessage::ServerShutdown {
+                    reason: Some(format!(
+                        "terminal session mirror failed: terminal {terminal_id} has no live runtime"
+                    )),
+                },
+            );
+            self.remove_client_and_resize_if_needed(client_id);
+            return false;
+        };
+
+        let stamp = self.allocate_activity_stamp();
+        let Some(client) = self.clients.get_mut(&client_id) else {
+            return false;
+        };
+        client.mode = ClientConnectionMode::TerminalMirror {
+            terminal_id: terminal_id.clone(),
+        };
+        client.pending_terminal_attach = false;
+        client.last_activity = stamp;
+        client.mirror_last_sent_seq = resume_from;
+        let was_foreground = self.foreground_client_id == Some(client_id);
+        if was_foreground {
+            self.promote_latest_remaining_client();
+        }
+
+        output_log.add_subscriber();
+        info!(client_id, terminal_id = %terminal_id, ?resume_from, "terminal mirror client connected");
+
+        // Deliver the initial snapshot (or resume delta) immediately; the run
+        // loop tails the rest via stream_mirror_updates.
+        self.flush_mirror_client(client_id, &output_log, resume_from);
+        true
+    }
+
+    /// Streams any mirror events newer than each mirror client's last delivered
+    /// sequence. Cheap when no mirror clients are connected.
+    fn stream_mirror_updates(&mut self) {
+        let mirror_clients: Vec<(u64, String, Option<u64>)> = self
+            .clients
+            .iter()
+            .filter_map(|(&client_id, client)| match &client.mode {
+                ClientConnectionMode::TerminalMirror { terminal_id } => {
+                    Some((client_id, terminal_id.clone(), client.mirror_last_sent_seq))
+                }
+                _ => None,
+            })
+            .collect();
+        if mirror_clients.is_empty() {
+            return;
+        }
+
+        for (client_id, terminal_id, last_sent) in mirror_clients {
+            match self
+                .runtime_for_terminal_id_string(&terminal_id)
+                .map(|runtime| runtime.output_log())
+            {
+                Some(output_log) => self.flush_mirror_client(client_id, &output_log, last_sent),
+                None => {
+                    // The mirrored terminal ended; close the stream.
+                    let seq = last_sent.unwrap_or(0).saturating_add(1);
+                    self.send_to_client(
+                        client_id,
+                        ServerMessage::MirrorEvent {
+                            seq,
+                            kind: crate::protocol::MirrorEventKind::Closed {
+                                reason: Some("terminal ended".to_owned()),
+                            },
+                        },
+                    );
+                    self.remove_client_and_resize_if_needed(client_id);
+                }
+            }
+        }
+    }
+
+    /// Sends the mirror messages needed to advance one client from `last_sent` to
+    /// the current state: a fresh snapshot when its position was evicted (or on
+    /// first subscribe), otherwise just the newer events. Updates the client's
+    /// recorded sequence on success.
+    fn flush_mirror_client(
+        &mut self,
+        client_id: u64,
+        output_log: &crate::terminal::MirrorLog,
+        last_sent: Option<u64>,
+    ) {
+        use crate::terminal::output_log::MirrorRead;
+
+        // Coarse backpressure: if this client's writer is already backed up, skip
+        // this flush rather than growing its queue without bound. Its recorded
+        // sequence does not advance, so the next flush retries from the same
+        // point; if it falls behind the bounded ring meanwhile, it is served a
+        // fresh snapshot automatically. (Ack-based trimming and a dedicated
+        // bounded lane are a later phase.)
+        let backlog = self
+            .clients
+            .get(&client_id)
+            .and_then(|client| client.writer.as_ref())
+            .map(|writer| writer.control.backlog_bytes())
+            .unwrap_or(0);
+        if backlog > MIRROR_MAX_CLIENT_BACKLOG_BYTES {
+            return;
+        }
+
+        let (snapshot, events) = match output_log.read_from(last_sent) {
+            MirrorRead::Snapshot {
+                base_seq,
+                cols,
+                rows,
+                events,
+            } => (Some((base_seq, cols, rows)), events),
+            MirrorRead::Delta { events } => (None, events),
+        };
+
+        if snapshot.is_none() && events.is_empty() {
+            return;
+        }
+
+        let mut cursor = last_sent;
+        if let Some((base_seq, cols, rows)) = snapshot {
+            if !self.send_to_client(
+                client_id,
+                ServerMessage::MirrorSnapshot {
+                    base_seq,
+                    cols,
+                    rows,
+                },
+            ) {
+                return;
+            }
+            cursor = Some(base_seq);
+        }
+        for (seq, kind) in events {
+            if !self.send_to_client(client_id, ServerMessage::MirrorEvent { seq, kind }) {
+                return;
+            }
+            cursor = Some(seq);
+        }
+        if let Some(client) = self.clients.get_mut(&client_id) {
+            client.mirror_last_sent_seq = cursor;
+        }
     }
 
     fn handle_terminal_attach_scroll(
@@ -2720,6 +2901,11 @@ impl HeadlessServer {
                 target,
                 takeover,
             } => self.control_terminal_client(client_id, target, takeover),
+            ServerEvent::ClientMirrorTerminal {
+                client_id,
+                target,
+                resume_from,
+            } => self.mirror_terminal_client(client_id, target, resume_from),
             ServerEvent::ClientAttachScroll {
                 client_id,
                 source,
@@ -2755,7 +2941,10 @@ impl HeadlessServer {
                 }
                 if matches!(
                     self.clients.get(&client_id).map(|client| &client.mode),
-                    Some(ClientConnectionMode::TerminalObserve { .. })
+                    Some(
+                        ClientConnectionMode::TerminalObserve { .. }
+                            | ClientConnectionMode::TerminalMirror { .. }
+                    )
                 ) {
                     return false;
                 }
@@ -2787,7 +2976,10 @@ impl HeadlessServer {
                 );
                 if matches!(
                     self.clients.get(&client_id).map(|client| &client.mode),
-                    Some(ClientConnectionMode::TerminalObserve { .. })
+                    Some(
+                        ClientConnectionMode::TerminalObserve { .. }
+                            | ClientConnectionMode::TerminalMirror { .. }
+                    )
                 ) {
                     return false;
                 }
@@ -2810,7 +3002,10 @@ impl HeadlessServer {
                 );
                 if matches!(
                     self.clients.get(&client_id).map(|client| &client.mode),
-                    Some(ClientConnectionMode::TerminalObserve { .. })
+                    Some(
+                        ClientConnectionMode::TerminalObserve { .. }
+                            | ClientConnectionMode::TerminalMirror { .. }
+                    )
                 ) {
                     return false;
                 }
@@ -2872,6 +3067,21 @@ impl HeadlessServer {
                     };
                     render_state.reset_baseline();
                     return true;
+                }
+                // A mirror client follows the source terminal's size and reflows
+                // locally, so its own resize never drives the shared runtime.
+                if matches!(
+                    self.clients.get(&client_id).map(|client| &client.mode),
+                    Some(ClientConnectionMode::TerminalMirror { .. })
+                ) {
+                    if let Some(client) = self.clients.get_mut(&client_id) {
+                        client.terminal_size = (cols, rows);
+                        client.cell_size = crate::kitty_graphics::HostCellSize {
+                            width_px: cell_width_px,
+                            height_px: cell_height_px,
+                        };
+                    }
+                    return false;
                 }
                 if let Some(client) = self.clients.get_mut(&client_id) {
                     client.terminal_size = (cols, rows);
@@ -3653,6 +3863,9 @@ impl HeadlessServer {
                     crate::render_prof::duration_since("full_render.frame_build", frame_started);
                     frame
                 }
+                // Mirror clients stream raw output (see stream_mirror_updates) and
+                // are never selected as render targets.
+                ClientConnectionMode::TerminalMirror { .. } => continue,
             };
 
             let Some(client) = self.clients.get_mut(&client_id) else {

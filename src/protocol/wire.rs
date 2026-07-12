@@ -13,7 +13,12 @@ use serde::{Deserialize, Serialize};
 // ---------------------------------------------------------------------------
 
 /// Current protocol version. Bumped when wire format changes incompatibly.
-pub const PROTOCOL_VERSION: u32 = 16;
+///
+/// v17 adds the responsive local mirror protocol: `ClientMessage::MirrorTerminal`
+/// and `ServerMessage::MirrorSnapshot` / `ServerMessage::MirrorEvent`, which
+/// replicate a terminal's raw PTY output stream (plus resize/close events) to a
+/// client that maintains its own terminal emulator locally.
+pub const PROTOCOL_VERSION: u32 = 17;
 
 /// Maximum allowed frame payload size (2 MB). Frames larger than this are
 /// rejected to prevent denial-of-service via oversized length prefixes.
@@ -395,6 +400,21 @@ pub enum ClientMessage {
         /// Replace an existing writable controller for this terminal.
         takeover: bool,
     },
+
+    /// Switch this connection into read-only terminal mirror mode.
+    ///
+    /// Unlike observe (which streams server-rendered frames), a mirror client
+    /// receives the terminal's raw PTY output plus resize/close events with
+    /// durable sequence numbers, so it can maintain its own local terminal
+    /// emulator and scroll/search/select without server round-trips.
+    MirrorTerminal {
+        /// Pane, terminal, or agent target to mirror.
+        target: String,
+        /// Highest contiguous mirror sequence the client already holds, if it is
+        /// resuming a previous stream. `None` requests a fresh replay from the
+        /// oldest retained output.
+        resume_from: Option<u64>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -583,6 +603,30 @@ pub struct TerminalFrame {
     pub bytes: Vec<u8>,
 }
 
+/// A single sequenced event in a terminal mirror stream.
+///
+/// Output and resize events share one durable sequence space so a mirror client
+/// applies them in strict order with no cross-type reordering.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MirrorEventKind {
+    /// Raw bytes read from the child PTY, to be fed verbatim into the client's
+    /// local terminal emulator.
+    Output(Vec<u8>),
+    /// The source terminal was resized. The client should resize its local
+    /// emulator to match before applying subsequent output.
+    Resize {
+        /// New terminal width in columns.
+        cols: u16,
+        /// New terminal height in rows.
+        rows: u16,
+    },
+    /// The mirrored terminal ended; the stream is complete.
+    Closed {
+        /// Optional human-readable reason.
+        reason: Option<String>,
+    },
+}
+
 /// Notification kind forwarded from server to client.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NotifyKind {
@@ -663,6 +707,29 @@ pub enum ServerMessage {
     PrefixInputSource {
         /// Whether the ASCII input source should be active.
         active: bool,
+    },
+
+    /// Establishes a mirror client's starting point for a terminal.
+    ///
+    /// Sent once when a client subscribes with `MirrorTerminal`. The client
+    /// should create/reset its local emulator to `cols` x `rows`, then apply the
+    /// `MirrorEvent`s that follow, whose sequence numbers begin at `base_seq + 1`.
+    MirrorSnapshot {
+        /// Sequence number the following events resume after. The client is
+        /// considered caught up through this sequence once the snapshot applies.
+        base_seq: u64,
+        /// Terminal width in columns at `base_seq`.
+        cols: u16,
+        /// Terminal height in rows at `base_seq`.
+        rows: u16,
+    },
+
+    /// A single sequenced mirror event (raw output, resize, or close).
+    MirrorEvent {
+        /// Durable, monotonically increasing sequence number for this terminal.
+        seq: u64,
+        /// The event payload.
+        kind: MirrorEventKind,
     },
 }
 
@@ -1043,6 +1110,13 @@ mod tests {
             }),
             9
         );
+        assert_eq!(
+            tag(&ClientMessage::MirrorTerminal {
+                target: "w1:p1".to_owned(),
+                resume_from: None,
+            }),
+            10
+        );
     }
 
     #[test]
@@ -1191,6 +1265,20 @@ mod tests {
         let (decoded, _): (ClientMessage, _) =
             bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
         assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn client_mirror_terminal_roundtrip() {
+        for resume_from in [None, Some(0), Some(u64::MAX)] {
+            let msg = ClientMessage::MirrorTerminal {
+                target: "w1:p1".to_owned(),
+                resume_from,
+            };
+            let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
+            let (decoded, _): (ClientMessage, _) =
+                bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+            assert_eq!(msg, decoded);
+        }
     }
 
     #[test]
@@ -1392,6 +1480,70 @@ mod tests {
         let (decoded, _): (ServerMessage, _) =
             bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
         assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn server_mirror_snapshot_roundtrip() {
+        let msg = ServerMessage::MirrorSnapshot {
+            base_seq: 42,
+            cols: 120,
+            rows: 40,
+        };
+        let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
+        let (decoded, _): (ServerMessage, _) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+        assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn server_mirror_event_roundtrip() {
+        let events = [
+            MirrorEventKind::Output(b"\x1b[1;1Hhello".to_vec()),
+            MirrorEventKind::Resize { cols: 80, rows: 24 },
+            MirrorEventKind::Closed {
+                reason: Some("pane exited".to_owned()),
+            },
+            MirrorEventKind::Closed { reason: None },
+        ];
+        for (i, kind) in events.into_iter().enumerate() {
+            let msg = ServerMessage::MirrorEvent {
+                seq: i as u64 + 1,
+                kind,
+            };
+            let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
+            let (decoded, _): (ServerMessage, _) =
+                bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+            assert_eq!(msg, decoded);
+        }
+    }
+
+    /// Locks the wire tag order of the mirror `ServerMessage` variants so future
+    /// additions append rather than insert (bincode encodes enum tags by
+    /// declaration order).
+    #[test]
+    fn server_mirror_message_wire_tags() {
+        fn tag(msg: &ServerMessage) -> u8 {
+            *bincode::serde::encode_to_vec(msg, bincode::config::standard())
+                .unwrap()
+                .first()
+                .expect("encoded server message should include enum tag")
+        }
+
+        assert_eq!(
+            tag(&ServerMessage::MirrorSnapshot {
+                base_seq: 0,
+                cols: 80,
+                rows: 24,
+            }),
+            11
+        );
+        assert_eq!(
+            tag(&ServerMessage::MirrorEvent {
+                seq: 1,
+                kind: MirrorEventKind::Output(Vec::new()),
+            }),
+            12
+        );
     }
 
     #[test]
