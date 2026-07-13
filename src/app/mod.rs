@@ -61,7 +61,7 @@ use crate::events::AppEvent;
 pub(crate) use input::{
     prefix_indexed_navigation_action, prefix_non_indexed_navigation_action,
     terminal_direct_indexed_navigation_action, terminal_direct_non_indexed_navigation_action,
-    NavigateAction,
+    ActionContext, NavigateAction,
 };
 pub use state::{AppState, Mode, ToastKind, ViewState};
 
@@ -152,6 +152,15 @@ pub struct App {
     /// even when an App-internal drain consumes the event before the forwarding drain.
     pub(crate) local_input_source_switch: bool,
     pub(crate) config_reloaded_from_disk: bool,
+    /// When `Some`, structural runtime mutations issued by the shared input
+    /// pipeline (`dispatch_runtime_mutation`) are captured here instead of being
+    /// handled in-process. The mirror client enables this so the server stays
+    /// authoritative: it reuses the server app's exact effect logic
+    /// (`execute_tui_navigate_action` and the per-mode key handlers) and then
+    /// drains the captured `Method`s and forwards them over the JSON API. `None`
+    /// (the default for the server/monolithic app) keeps the in-process path, so
+    /// this seam is inert for every non-mirror `App`.
+    pub(crate) captured_runtime_mutations: Option<Vec<crate::api::schema::Method>>,
     prefix_input_source: Box<dyn crate::platform::PrefixInputSource>,
 }
 
@@ -762,6 +771,7 @@ impl App {
             local_terminal_notifications: true,
             local_input_source_switch: true,
             config_reloaded_from_disk: false,
+            captured_runtime_mutations: None,
             prefix_input_source: Box::new(crate::platform::RealPrefixInputSource::default()),
         }
     }

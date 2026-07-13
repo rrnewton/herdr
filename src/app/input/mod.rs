@@ -48,7 +48,8 @@ mod terminal;
 
 #[cfg(unix)]
 pub(crate) use self::navigate::{
-    prefix_indexed_navigation_action, prefix_non_indexed_navigation_action, NavigateAction,
+    prefix_indexed_navigation_action, prefix_non_indexed_navigation_action, ActionContext,
+    NavigateAction,
 };
 pub(crate) use self::{
     modal::{
@@ -90,33 +91,46 @@ impl App {
 
         match self.state.mode {
             Mode::Terminal => self.handle_terminal_key(key).await,
+            _ => self.handle_non_terminal_key(key),
+        }
+    }
+
+    /// Dispatches a key for every interaction mode **except** `Terminal` (whose
+    /// keystroke handling is async and differs between the server app and the
+    /// mirror client). This is the single shared entry point the mirror reuses so
+    /// prefix commands, copy mode, navigate mode, settings, help, the navigator,
+    /// rename/worktree/confirm modals, resize, and context menus all behave
+    /// identically without duplicating per-mode logic. Structural side effects
+    /// route through `dispatch_runtime_mutation`, which the mirror captures.
+    pub(crate) fn handle_non_terminal_key(&mut self, key: TerminalKey) {
+        let key_event = key.as_key_event();
+        match self.state.mode {
+            // Terminal keystrokes are forwarded by the caller (the server app
+            // awaits the PTY; the mirror forwards to the focused mirror runtime).
+            Mode::Terminal => {}
             Mode::Prefix => self.handle_prefix_key(key),
             Mode::Navigate => self.handle_navigate_key(key),
             Mode::Copy => self.handle_copy_mode_key(key),
-            _ => match self.state.mode {
-                Mode::Onboarding => self.handle_onboarding_key(key_event),
-                Mode::ReleaseNotes => self.handle_release_notes_key(key_event),
-                Mode::ProductAnnouncement => self.handle_product_announcement_key(key_event),
-                Mode::Prefix | Mode::Navigate | Mode::Copy => unreachable!(),
-                Mode::RenameWorkspace | Mode::RenameTab | Mode::RenamePane => {
-                    self.handle_rename_key_via_api(key_event)
-                }
-                Mode::NewLinkedWorktree => self.handle_worktree_create_key(key_event),
-                Mode::OpenExistingWorktree => self.handle_worktree_open_key(key_event),
-                Mode::ConfirmRemoveWorktree => self.handle_worktree_remove_key(key_event),
-                Mode::Resize => self.handle_resize_key_via_api(key),
-                Mode::ConfirmClose => self.handle_confirm_close_key_via_api(key_event),
-                Mode::ContextMenu => {
-                    self.handle_context_menu_key_via_api(key_event);
-                }
-                Mode::Settings => self.handle_settings_key(key_event),
-                Mode::GlobalMenu => handle_global_menu_key(&mut self.state, key_event),
-                Mode::KeybindHelp => handle_keybind_help_key(&mut self.state, key_event),
-                Mode::Navigator => {
-                    handle_navigator_key(&mut self.state, &self.terminal_runtimes, key_event)
-                }
-                Mode::Terminal => unreachable!(),
-            },
+            Mode::Onboarding => self.handle_onboarding_key(key_event),
+            Mode::ReleaseNotes => self.handle_release_notes_key(key_event),
+            Mode::ProductAnnouncement => self.handle_product_announcement_key(key_event),
+            Mode::RenameWorkspace | Mode::RenameTab | Mode::RenamePane => {
+                self.handle_rename_key_via_api(key_event)
+            }
+            Mode::NewLinkedWorktree => self.handle_worktree_create_key(key_event),
+            Mode::OpenExistingWorktree => self.handle_worktree_open_key(key_event),
+            Mode::ConfirmRemoveWorktree => self.handle_worktree_remove_key(key_event),
+            Mode::Resize => self.handle_resize_key_via_api(key),
+            Mode::ConfirmClose => self.handle_confirm_close_key_via_api(key_event),
+            Mode::ContextMenu => {
+                self.handle_context_menu_key_via_api(key_event);
+            }
+            Mode::Settings => self.handle_settings_key(key_event),
+            Mode::GlobalMenu => handle_global_menu_key(&mut self.state, key_event),
+            Mode::KeybindHelp => handle_keybind_help_key(&mut self.state, key_event),
+            Mode::Navigator => {
+                handle_navigator_key(&mut self.state, &self.terminal_runtimes, key_event)
+            }
         }
     }
 

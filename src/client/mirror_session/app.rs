@@ -26,8 +26,8 @@ use crate::api::client::ApiClientError;
 use crate::api::schema::{Method, PaneTarget};
 use crate::app::{
     prefix_indexed_navigation_action, prefix_non_indexed_navigation_action,
-    terminal_direct_indexed_navigation_action, terminal_direct_non_indexed_navigation_action, App,
-    Mode, NavigateAction,
+    terminal_direct_indexed_navigation_action, terminal_direct_non_indexed_navigation_action,
+    ActionContext, App, Mode, NavigateAction,
 };
 use crate::client::io_pump::{ClientEventPump, ClientLoopHandler, LoopEnd};
 use crate::client::{ClientError, ClientLoopEvent, TerminalGuard};
@@ -38,7 +38,7 @@ use crate::protocol::{AttachScrollSource, ServerMessage};
 use crate::raw_input::{parse_raw_input_bytes_sync, RawInputEvent};
 use crate::terminal::{TerminalId, TerminalRuntime};
 
-use super::action::{self, ActionClass, JsonApiSink, MirrorActionSink};
+use super::action::{JsonApiSink, MirrorActionSink};
 use super::control::{JsonApiClient, JsonApiError};
 use super::projection::{rebuild_app_state, MirrorTabChannels};
 use super::replica::{ReplicaChange, SessionReplica};
@@ -104,6 +104,12 @@ impl MirrorApp {
             &channels,
             /* preserve_overlay_mode = */ false,
         );
+
+        // Reuse the server app's exact effect logic: enable the capture seam so
+        // any structural mutation the shared input pipeline issues is recorded
+        // (and later forwarded to the authoritative server) instead of being
+        // applied to this PTY-less replica.
+        app.captured_runtime_mutations = Some(Vec::new());
 
         Ok(Self {
             app,
@@ -241,7 +247,7 @@ impl MirrorApp {
         if let Some(action) = terminal_direct_non_indexed_navigation_action(self.state(), key)
             .or_else(|| terminal_direct_indexed_navigation_action(self.state(), key))
         {
-            self.dispatch_action(action);
+            self.dispatch_action(action, ActionContext::Direct);
             return Ok(());
         }
 
@@ -282,34 +288,49 @@ impl MirrorApp {
         if key.as_key_event().kind == KeyEventKind::Release || is_modifier_only_key(&key) {
             return Ok(());
         }
-        self.state_mut().mode = Mode::Terminal;
         self.needs_redraw = true;
 
         if key.as_key_event().code == KeyCode::Esc {
+            self.leave_prefix_menu();
             return Ok(());
         }
         if self.state().is_prefix_key(key) {
             // Double prefix: send a literal prefix key to the focused pane.
+            self.leave_prefix_menu();
             return self.forward_key(key);
         }
         if let Some(action) = prefix_non_indexed_navigation_action(self.state(), key)
             .or_else(|| prefix_indexed_navigation_action(self.state(), key))
         {
-            self.dispatch_action(action);
+            // Keep `Mode::Prefix` set while executing: the shared
+            // `execute_tui_navigate_action` returns to `Terminal` itself when the
+            // action does not open its own mode (via `finish_action_context`),
+            // and leaves the new mode in place when it does (e.g. Settings, copy
+            // mode) — exactly as the server app's `execute_prefix_key_action`.
+            self.dispatch_action(action, ActionContext::Prefix);
+        } else {
+            // Unrecognized command key: dismiss the menu without leaking to the pane.
+            self.leave_prefix_menu();
         }
         Ok(())
     }
 
-    /// Handles a key while a non-terminal command overlay is open (resize mode,
-    /// the workspace picker, …). Full interactive parity for those modes is a
-    /// later phase; for now the overlay is never a trap — the prefix key or Esc
-    /// returns to the terminal, and other keys are consumed rather than leaking to
-    /// the focused PTY.
+    /// Dismisses the prefix menu back to terminal interaction.
+    fn leave_prefix_menu(&mut self) {
+        self.state_mut().mode = Mode::Terminal;
+        self.needs_redraw = true;
+    }
+
+    /// Handles a key while a non-terminal interaction mode is active (copy mode,
+    /// navigate/workspace picker, settings, help, the navigator, rename/worktree/
+    /// confirm modals, resize, context menus). Delegates to the server app's exact
+    /// per-mode handlers via [`App::handle_non_terminal_key`], so these modes
+    /// behave identically to the normal TUI. Structural effects (e.g. a rename or
+    /// resize committed from a modal) are captured and forwarded to the server.
     fn handle_overlay_key(&mut self, key: TerminalKey) -> Result<(), ClientError> {
-        if key.as_key_event().code == KeyCode::Esc || self.state().is_prefix_key(key) {
-            self.state_mut().mode = Mode::Terminal;
-            self.needs_redraw = true;
-        }
+        self.app.handle_non_terminal_key(key);
+        self.forward_captured_mutations();
+        self.needs_redraw = true;
         Ok(())
     }
 
@@ -529,6 +550,15 @@ impl MirrorApp {
     }
 
     fn forward_paste(&mut self, text: String) -> Result<(), ClientError> {
+        // In a non-terminal mode, a paste belongs to the active overlay (rename,
+        // navigator/worktree search, copy-mode search), not the focused pane —
+        // route it through the shared text-input handler the server app uses.
+        if self.state().mode != Mode::Terminal {
+            self.app.paste_into_active_text_input(&text);
+            self.forward_captured_mutations();
+            self.needs_redraw = true;
+            return Ok(());
+        }
         let Some(runtime) = self.focused_runtime() else {
             return Ok(());
         };
@@ -607,40 +637,37 @@ impl MirrorApp {
         Some((public_id, terminal_id))
     }
 
-    fn dispatch_action(&mut self, action: NavigateAction) {
-        if action == NavigateAction::Detach {
-            self.state_mut().detach_requested = true;
-            return;
-        }
-        match action::classify(action) {
-            ActionClass::Structural => {
-                if let Some(method) = action::structural_method(action, &self.replica) {
-                    let sink = JsonApiSink {
-                        control: &self.control,
-                    };
-                    if let Err(err) = sink.dispatch("tui.mirror.action", method) {
-                        warn!(?action, err = %err, "mirror structural action failed");
-                    }
-                    // The replica updates when the resulting event arrives.
-                }
-            }
-            ActionClass::ViewLocal => self.apply_view_local(action),
-            ActionClass::Unsupported => {}
-        }
+    /// Runs a resolved [`NavigateAction`] through the server app's shared effect
+    /// logic ([`App::execute_tui_navigate_action`]). View-local actions (copy
+    /// mode, help, settings, navigator, resize/workspace-picker entry, sidebar
+    /// toggle, rename-modal open, detach) mutate the replica `AppState` directly;
+    /// structural actions (new/close/move/focus/split/zoom/reload across pane,
+    /// tab, workspace) are captured by the replica `App` and forwarded to the
+    /// authoritative server here. Because the effect layer is shared, *every*
+    /// action the main TUI supports works in the mirror with no per-action
+    /// curation — new keybindings are picked up automatically.
+    fn dispatch_action(&mut self, action: NavigateAction, context: ActionContext) {
+        self.app.execute_tui_navigate_action(action, context);
+        self.forward_captured_mutations();
+        self.needs_redraw = true;
     }
 
-    /// Applies a view-local action to the local replica (zero round-trip). Only
-    /// the presentation actions with a pure `AppState` effect are handled here;
-    /// richer modal/copy-mode flows are layered in a later phase.
-    fn apply_view_local(&mut self, action: NavigateAction) {
-        match action {
-            NavigateAction::ToggleSidebar => {
-                let collapsed = self.state().sidebar_collapsed;
-                self.state_mut().sidebar_collapsed = !collapsed;
+    /// Drains the structural mutations the shared input pipeline captured on the
+    /// replica `App` and forwards each to the authoritative server over the JSON
+    /// API. The replica updates only when the resulting event arrives (server
+    /// stays authoritative), matching the mirror's control-plane model.
+    fn forward_captured_mutations(&mut self) {
+        let methods = match self.app.captured_runtime_mutations.as_mut() {
+            Some(buffer) if !buffer.is_empty() => std::mem::take(buffer),
+            _ => return,
+        };
+        let sink = JsonApiSink {
+            control: &self.control,
+        };
+        for method in methods {
+            if let Err(err) = sink.dispatch("tui.mirror.action", method) {
+                warn!(err = %err, "mirror captured mutation dispatch failed");
             }
-            NavigateAction::EnterResizeMode => self.state_mut().mode = Mode::Resize,
-            NavigateAction::WorkspacePicker => self.state_mut().mode = Mode::Navigate,
-            _ => {}
         }
         self.needs_redraw = true;
     }

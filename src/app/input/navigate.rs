@@ -198,7 +198,7 @@ impl App {
         }
     }
 
-    pub(super) fn execute_tui_navigate_action(
+    pub(crate) fn execute_tui_navigate_action(
         &mut self,
         action: NavigateAction,
         context: ActionContext,
