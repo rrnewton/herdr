@@ -7,14 +7,15 @@
 //! directly where useful, and (for TUI-level assertions) spawn the client under a
 //! PTY and capture its rendered output.
 //!
-//! Status: the full mirror TUI is NOT implemented yet, so every acceptance test is
-//! `#[ignore]` — this keeps `cargo test` green for concurrent work while the file
-//! still compiles (`cargo test --test mirror_tui_session --no-run`). Removing an
-//! `#[ignore]` and making it pass is the acceptance gate for that capability.
+//! Status: the full mirror TUI (`herdr --mirror`) is implemented, and these
+//! acceptance tests run and pass by default. The only remaining `#[ignore]` is
+//! `search_and_selection_are_local` (H3), which depends on mirror copy-mode —
+//! an explicitly-deferred capability (see that test's ignore reason). Removing
+//! that `#[ignore]` and making it pass is the acceptance gate for copy-mode.
 //!
-//! The helpers below are fully implemented so the file compiles today; a few
-//! assertions describe behavior the client does not yet produce and will fail at
-//! runtime until it does (that is the point of an acceptance skeleton).
+//! The helpers below are fully implemented; assertions exercise the live client
+//! (startup/discovery, render parity, cached-scrollback pane switching, scroll
+//! policy, resize, reconnect/resume, and multi-pane input/focus).
 
 #![allow(dead_code)]
 
@@ -2303,7 +2304,7 @@ fn deep_scrollback_scroll_is_local() {
 #[test]
 #[ignore = "H3 depends on copy-mode/search in the mirror session, which is an \
             explicitly-deferred capability: `client::mirror_session::action::classify` \
-            maps `CopyMode` to a view-local action, but \
+            currently maps `CopyMode` to `Unsupported`, and \
             `client::mirror_session::app::MirrorApp::apply_view_local` does not yet \
             implement copy-mode/search/selection (its own doc note: 'richer \
             modal/copy-mode flows are layered in a later phase'). The locality of \
@@ -2327,15 +2328,15 @@ fn search_and_selection_are_local() {
 
 // ===========================================================================
 // Compile-guard: confirms the harness itself is wired up. Runs by default.
-// (Kept minimal so `cargo test` stays green; the real acceptance suite is the
-// #[ignore]d tests above, run with `--ignored`.)
+// (A minimal smoke test alongside the full acceptance suite above, which also
+// runs by default; the sole `#[ignore]` is the H3 copy-mode gate.)
 // ===========================================================================
 
 #[test]
 fn harness_starts_server_and_creates_pane() {
     let _guard = mirror_tui_test_guard();
     // Uses only the JSON shapes already validated by tests/terminal_mirror.rs, so
-    // this stays reliably green while the acceptance suite above is #[ignore]d.
+    // this stays a reliable, dependency-light smoke check.
     let sess = Session::new();
     let _server = spawn_server(&sess);
     let pane_id = create_workspace_root_pane(&sess.api_socket, "harness");

@@ -56,8 +56,6 @@ pub(crate) struct MirrorApp {
     terminal: DefaultTerminal,
     /// Restores terminal modes on drop.
     _guard: TerminalGuard,
-    /// Whether the herdr prefix key is armed (next key is a command).
-    prefix_active: bool,
     client_size: (u16, u16),
     /// The last `(terminal_id, cols, rows)` we drove the focused pane's PTY to,
     /// to avoid re-sending an identical resize while the echo is in flight.
@@ -115,7 +113,6 @@ impl MirrorApp {
             channels,
             terminal,
             _guard: guard,
-            prefix_active: false,
             client_size: (cols, rows),
             last_forwarded_pane_size: None,
             mouse_scroll_lines,
@@ -221,25 +218,18 @@ impl MirrorApp {
     }
 
     fn handle_key(&mut self, key: TerminalKey) -> Result<(), ClientError> {
-        if self.prefix_active {
-            self.prefix_active = false;
-            if key.as_key_event().code == KeyCode::Esc {
-                return Ok(());
-            }
-            if self.state().is_prefix_key(key) {
-                // Double prefix: send a literal prefix key to the focused pane.
-                return self.forward_key(key);
-            }
-            if let Some(action) = prefix_non_indexed_navigation_action(self.state(), key)
-                .or_else(|| prefix_indexed_navigation_action(self.state(), key))
-            {
-                self.dispatch_action(action);
-            }
-            return Ok(());
+        // Route by the current interaction mode, mirroring the server app's
+        // mode-aware dispatch (`src/app/input/mod.rs`). The prefix menu and the
+        // other command overlays are driven by `state.mode`, so the shared render
+        // path shows them exactly as the normal TUI does.
+        match self.state().mode {
+            Mode::Prefix => return self.handle_prefix_key(key),
+            Mode::Terminal => {}
+            _ => return self.handle_overlay_key(key),
         }
 
         if self.state().is_prefix_key(key) {
-            self.prefix_active = true;
+            self.arm_prefix();
             return Ok(());
         }
 
@@ -273,6 +263,54 @@ impl MirrorApp {
         }
 
         self.forward_key(key)
+    }
+
+    /// Arms the herdr prefix: the next key is a command and the prefix menu
+    /// overlay renders (`Mode::Prefix`), exactly as in the server TUI
+    /// (`src/app/input/terminal.rs`).
+    fn arm_prefix(&mut self) {
+        self.state_mut().mode = Mode::Prefix;
+        self.needs_redraw = true;
+    }
+
+    /// Resolves the key that follows the prefix (`Mode::Prefix`). Dismisses the
+    /// prefix menu, then dispatches the bound action (a view-local action may open
+    /// its own mode immediately afterwards).
+    fn handle_prefix_key(&mut self, key: TerminalKey) -> Result<(), ClientError> {
+        // Ignore releases and lone modifier keys so lifting the prefix chord
+        // (e.g. releasing Ctrl) does not dismiss the menu before a command key.
+        if key.as_key_event().kind == KeyEventKind::Release || is_modifier_only_key(&key) {
+            return Ok(());
+        }
+        self.state_mut().mode = Mode::Terminal;
+        self.needs_redraw = true;
+
+        if key.as_key_event().code == KeyCode::Esc {
+            return Ok(());
+        }
+        if self.state().is_prefix_key(key) {
+            // Double prefix: send a literal prefix key to the focused pane.
+            return self.forward_key(key);
+        }
+        if let Some(action) = prefix_non_indexed_navigation_action(self.state(), key)
+            .or_else(|| prefix_indexed_navigation_action(self.state(), key))
+        {
+            self.dispatch_action(action);
+        }
+        Ok(())
+    }
+
+    /// Handles a key while a non-terminal command overlay is open (resize mode,
+    /// the workspace picker, …). Full interactive parity for those modes is a
+    /// later phase; for now the overlay is never a trap — the prefix key or Esc
+    /// returns to the terminal, and other keys are consumed rather than leaking to
+    /// the focused PTY.
+    fn handle_overlay_key(&mut self, key: TerminalKey) -> Result<(), ClientError> {
+        if key.as_key_event().code == KeyCode::Esc || self.state().is_prefix_key(key) {
+            self.state_mut().mode = Mode::Terminal;
+            self.needs_redraw = true;
+        }
+        Ok(())
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) -> Result<(), ClientError> {
@@ -632,16 +670,23 @@ impl MirrorApp {
         use super::MirrorApply;
         match self.data.apply(terminal_id, msg) {
             MirrorApply::Applied(outcome) => {
-                // Repaint on a full redraw, or whenever this terminal isn't
-                // scrolled back (new output at the live tail should show).
-                outcome.needs_full_redraw || outcome.closed || self.is_focused_terminal(terminal_id)
+                // Repaint on a reset/resize or close, or whenever this terminal is
+                // currently on screen — new output in *any* visible pane (not just
+                // the focused one) must repaint, or background panes go stale.
+                outcome.needs_full_redraw || outcome.closed || self.is_visible_terminal(terminal_id)
             }
             MirrorApply::NotMirror | MirrorApply::Unknown => false,
         }
     }
 
-    fn is_focused_terminal(&self, terminal_id: &str) -> bool {
-        self.data.focused() == Some(terminal_id)
+    /// Whether `terminal_id` backs a pane currently laid out on screen (the active
+    /// tab's visible panes). Panes on other tabs are not visible, so their output
+    /// need not force a repaint.
+    fn is_visible_terminal(&self, terminal_id: &str) -> bool {
+        self.app.state.view.pane_infos.iter().any(|info| {
+            self.public_and_terminal_for_local_pane(info.id)
+                .is_some_and(|(_, tid)| tid == terminal_id)
+        })
     }
 
     // --- control plane --------------------------------------------------------
