@@ -126,6 +126,25 @@ impl MirrorApp {
         })
     }
 
+    /// Advances the agent-panel spinner on the shared 100ms client timer, matching
+    /// the server TUI's animation gating: only when a pane is `Working` (so an idle
+    /// mirror never repaints) and only then requesting a redraw. Without this the
+    /// projected Working state would render as a frozen spinner. The client pump's
+    /// tick is coarser than the server's 16ms `ANIMATION_INTERVAL`, so the spinner
+    /// animates a little slower, but it is no longer static.
+    fn tick_animation(&mut self) {
+        let has_working = self
+            .app
+            .state
+            .workspaces
+            .iter()
+            .any(|ws| ws.has_working_pane(&self.app.state.terminals));
+        if has_working {
+            self.app.state.spinner_tick = self.app.state.spinner_tick.wrapping_add(1);
+            self.needs_redraw = true;
+        }
+    }
+
     fn state(&self) -> &crate::app::AppState {
         &self.app.state
     }
@@ -885,7 +904,7 @@ impl ClientLoopHandler for MirrorApp {
             ClientLoopEvent::ControlDisconnected => self.handle_control_disconnected(pump),
             // The mirror holds no untagged server connection; these can't occur.
             ClientLoopEvent::ServerMessage(_) | ClientLoopEvent::ServerDisconnected => {}
-            ClientLoopEvent::Timer => {}
+            ClientLoopEvent::Timer => self.tick_animation(),
         }
 
         if self.state().should_quit || self.state().detach_requested {

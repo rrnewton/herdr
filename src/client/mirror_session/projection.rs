@@ -23,13 +23,16 @@ use ratatui::layout::Direction;
 use tokio::sync::{mpsc, Notify};
 use tracing::warn;
 
-use crate::api::schema::{LayoutNode, SplitDirection, TabInfo};
+use crate::api::schema::{
+    AgentStatus, LayoutNode, PaneInfo, SplitDirection, TabInfo, WorkspaceInfo,
+};
 use crate::app::{AppState, Mode};
+use crate::detect::AgentState;
 use crate::events::AppEvent;
 use crate::layout::{Node, PaneId, TileLayout};
 use crate::pane::PaneState;
-use crate::terminal::{TerminalId, TerminalState};
-use crate::workspace::{Tab, Workspace};
+use crate::terminal::{AgentMetadataReport, TerminalId, TerminalState};
+use crate::workspace::{Tab, Workspace, WorktreeSpaceMembership};
 
 use super::control::JsonApiClient;
 use super::replica::SessionReplica;
@@ -113,17 +116,24 @@ pub(crate) fn rebuild_app_state(
         let identity_cwd =
             identity_cwd.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| "/".into()));
 
-        workspaces.push(Workspace::from_mirror(
+        let projected_ws = project_workspace_metadata(ws_info);
+
+        let mut workspace = Workspace::from_mirror(
             ws_info.workspace_id.clone(),
             Some(ws_info.label.clone()),
             identity_cwd,
-            ws_info.branch.clone(),
+            projected_ws.branch,
             projected_tabs,
             active_tab,
             public_pane_numbers,
             next_pane_number,
             tabs.len() + 1,
-        ));
+        );
+        // The server exports each workspace's worktree-space membership so the
+        // mirror sidebar groups linked worktrees under one collapsible space,
+        // exactly like the server TUI (`render_workspace_list`).
+        workspace.worktree_space = projected_ws.worktree_space;
+        workspaces.push(workspace);
     }
 
     let active = replica
@@ -209,9 +219,11 @@ fn project_tab(
 
     let tile = TileLayout::from_saved(node, focus_pane);
 
+    let (label, number) = project_tab_metadata(tab_info);
+
     Some(Tab::from_mirror(
-        Some(tab_info.label.clone()),
-        tab_info.number,
+        Some(label),
+        number,
         root_pane,
         tile,
         panes,
@@ -266,14 +278,17 @@ fn convert_layout_node(
             }
 
             let mut terminal_state = TerminalState::new(terminal_id.clone(), cwd);
-            if let Some(label) = info.and_then(|info| info.label.clone()) {
-                terminal_state.set_manual_label(label);
-            }
-            if let Some(agent) = info.and_then(|info| info.agent.clone()) {
-                terminal_state.set_agent_name(agent);
-            }
+            // Reconstruct the server's pane presentation (labels, agent state,
+            // and effective metadata) so the shared renderer draws the mirror's
+            // sidebar dots, agent panel, and border labels identically. Defaults
+            // to `seen = true` when the server sent no metadata for this pane.
+            let seen = info
+                .map(|info| project_pane_metadata(&mut terminal_state, info))
+                .unwrap_or(true);
             terminals.insert(terminal_id.clone(), terminal_state);
-            panes.insert(pane_id, PaneState::new(terminal_id));
+            let mut pane_state = PaneState::new(terminal_id);
+            pane_state.seen = seen;
+            panes.insert(pane_id, pane_state);
 
             if let Some(public_id) = pane.pane_id.clone() {
                 pane_string_to_id.insert(public_id.clone(), pane_id);
@@ -322,5 +337,303 @@ fn convert_layout_node(
                 first_pane,
             )),
         },
+    }
+}
+
+/// Projects one server [`TabInfo`] into the render inputs the mirror rebuilds
+/// (label + stable number). Destructured exhaustively (no `..`) so a new
+/// server-provided tab field fails the build here until the mirror handles it.
+fn project_tab_metadata(info: &TabInfo) -> (String, usize) {
+    let TabInfo {
+        // Used by the caller to fetch this tab's exported layout.
+        tab_id: _,
+        // Tabs are already scoped to their workspace by the caller's filter.
+        workspace_id: _,
+        // Derived by the projection from focus/panes, not carried into `Tab`.
+        focused: _,
+        pane_count: _,
+        agent_status: _,
+        label,
+        number,
+    } = info;
+    (label.clone(), *number)
+}
+
+/// Metadata source key for presentation the mirror reconstructs from the server's
+/// `PaneInfo`. A single stable source keeps `effective_presentation()` returning
+/// exactly the fields the server computed (it aggregates by source).
+const MIRROR_METADATA_SOURCE: &str = "mirror";
+
+/// Reverses [`crate::app::api_helpers::pane_agent_status`]: recovers the
+/// `(AgentState, seen)` pair the server collapsed into a single [`AgentStatus`].
+/// `Done` is the only status that encodes "unseen"; the working/blocked seen bit
+/// is not carried on the wire but does not affect attention priority, so `true`
+/// is the faithful default there.
+fn agent_status_to_state_and_seen(status: AgentStatus) -> (AgentState, bool) {
+    match status {
+        AgentStatus::Idle => (AgentState::Idle, true),
+        AgentStatus::Working => (AgentState::Working, true),
+        AgentStatus::Blocked => (AgentState::Blocked, true),
+        AgentStatus::Done => (AgentState::Idle, false),
+        AgentStatus::Unknown => (AgentState::Unknown, true),
+    }
+}
+
+/// Projects one server [`PaneInfo`] onto the reconstructed [`TerminalState`],
+/// returning the pane's `seen` flag for its [`PaneState`].
+///
+/// The `PaneInfo` is destructured exhaustively (no `..`): when the server grows a
+/// new pane-presentation field, this fails to compile until the mirror decides
+/// whether and how to render it — the render-layer analogue of the
+/// compile-enforced input pipeline. Fields that are structural ids, live
+/// geometry, or runtime facts (not render inputs the projection reconstructs) are
+/// bound to `_` with a note explaining why.
+pub(super) fn project_pane_metadata(terminal: &mut TerminalState, info: &PaneInfo) -> bool {
+    let PaneInfo {
+        // Structural ids: consumed by the caller / replica keying, not TerminalState.
+        pane_id: _,
+        terminal_id: _,
+        workspace_id: _,
+        tab_id: _,
+        // Focus is projected via the tab's `TileLayout` focus + `AppState::active`.
+        focused: _,
+        // Live geometry follows the mirror runtime's replicated stream (§3.3).
+        cols: _,
+        rows: _,
+        // cwd is resolved by the caller (with the layout node's cwd as fallback).
+        cwd: _,
+        foreground_cwd: _,
+        label,
+        agent,
+        title,
+        display_agent,
+        agent_status,
+        custom_status,
+        state_labels,
+        // Runtime facts, not render inputs the projection reconstructs.
+        agent_session: _,
+        scroll: _,
+        revision: _,
+    } = info;
+
+    if let Some(label) = label {
+        terminal.set_manual_label(label.clone());
+    }
+    if let Some(agent) = agent {
+        terminal.set_agent_name(agent.clone());
+    }
+
+    // Reconstruct the effective presentation (title / display agent / custom
+    // status / state labels) the server computed so the sidebar agent panel and
+    // pane border labels match. `set_agent_metadata` recomputes `state` from
+    // `fallback_state`, so it must run before we pin the agent state below.
+    if title.is_some()
+        || display_agent.is_some()
+        || custom_status.is_some()
+        || !state_labels.is_empty()
+    {
+        terminal.set_agent_metadata(AgentMetadataReport {
+            source: MIRROR_METADATA_SOURCE.to_string(),
+            agent_label: None,
+            applies_to_source: None,
+            title: title.clone(),
+            display_agent: display_agent.clone(),
+            custom_status: custom_status.clone(),
+            state_labels: state_labels.clone(),
+            clear_title: false,
+            clear_display_agent: false,
+            clear_custom_status: false,
+            clear_state_labels: false,
+            ttl: None,
+            seq: None,
+        });
+    }
+
+    let (state, seen) = agent_status_to_state_and_seen(*agent_status);
+    terminal.fallback_state = state;
+    terminal.state = state;
+    seen
+}
+
+/// The render inputs the mirror reconstructs from a server [`WorkspaceInfo`].
+pub(super) struct ProjectedWorkspace {
+    pub(super) branch: Option<String>,
+    pub(super) worktree_space: Option<WorktreeSpaceMembership>,
+}
+
+/// Projects one server [`WorkspaceInfo`] into the render inputs the mirror rebuilds
+/// (branch subtitle + worktree-space grouping). Like [`project_pane_metadata`],
+/// the struct is destructured exhaustively so a new server-provided workspace
+/// field fails the build here until the mirror handles it.
+pub(super) fn project_workspace_metadata(info: &WorkspaceInfo) -> ProjectedWorkspace {
+    let WorkspaceInfo {
+        // Public id + label are passed to `Workspace::from_mirror` directly.
+        workspace_id: _,
+        label: _,
+        // Derived by the projection from the rebuilt tabs/panes, not the wire.
+        number: _,
+        focused: _,
+        pane_count: _,
+        tab_count: _,
+        active_tab_id: _,
+        // Aggregated by the renderer from each pane's projected agent state.
+        agent_status: _,
+        branch,
+        worktree,
+    } = info;
+
+    let worktree_space = worktree.as_ref().map(|worktree| WorktreeSpaceMembership {
+        key: worktree.repo_key.clone(),
+        label: worktree.repo_name.clone(),
+        repo_root: PathBuf::from(&worktree.repo_root),
+        checkout_path: PathBuf::from(&worktree.checkout_path),
+        is_linked_worktree: worktree.is_linked_worktree,
+    });
+
+    ProjectedWorkspace {
+        branch: branch.clone(),
+        worktree_space,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use crate::api::schema::{AgentStatus, PaneInfo, WorkspaceInfo, WorkspaceWorktreeInfo};
+    use crate::detect::AgentState;
+    use crate::terminal::{TerminalId, TerminalState};
+
+    use super::{project_pane_metadata, project_workspace_metadata};
+
+    fn pane_info(agent_status: AgentStatus) -> PaneInfo {
+        PaneInfo {
+            pane_id: "p1".into(),
+            terminal_id: "t1".into(),
+            workspace_id: "w1".into(),
+            tab_id: "tab1".into(),
+            focused: false,
+            cols: None,
+            rows: None,
+            cwd: None,
+            foreground_cwd: None,
+            label: None,
+            agent: None,
+            title: None,
+            display_agent: None,
+            agent_status,
+            custom_status: None,
+            state_labels: HashMap::new(),
+            agent_session: None,
+            scroll: None,
+            revision: 0,
+        }
+    }
+
+    fn terminal() -> TerminalState {
+        TerminalState::new(TerminalId::alloc(), "/".into())
+    }
+
+    #[test]
+    fn projects_agent_state_labels_and_effective_presentation() {
+        let mut state_labels = HashMap::new();
+        state_labels.insert("working".to_string(), "cooking".to_string());
+        let info = PaneInfo {
+            label: Some("build".into()),
+            agent: Some("pi".into()),
+            title: Some("running tests".into()),
+            display_agent: Some("Pi".into()),
+            custom_status: Some("87%".into()),
+            state_labels: state_labels.clone(),
+            ..pane_info(AgentStatus::Working)
+        };
+
+        let mut terminal = terminal();
+        let seen = project_pane_metadata(&mut terminal, &info);
+
+        assert!(seen, "Working is a seen state");
+        assert_eq!(terminal.state, AgentState::Working);
+        assert_eq!(terminal.fallback_state, AgentState::Working);
+        assert_eq!(terminal.manual_label.as_deref(), Some("build"));
+        assert_eq!(terminal.agent_name.as_deref(), Some("pi"));
+        let presentation = terminal.effective_presentation();
+        assert_eq!(presentation.title.as_deref(), Some("running tests"));
+        assert_eq!(presentation.display_agent.as_deref(), Some("Pi"));
+        assert_eq!(presentation.custom_status.as_deref(), Some("87%"));
+        assert_eq!(presentation.state_labels, state_labels);
+    }
+
+    #[test]
+    fn done_status_maps_to_unseen_idle() {
+        let mut terminal = terminal();
+        let seen = project_pane_metadata(&mut terminal, &pane_info(AgentStatus::Done));
+        assert!(!seen, "Done encodes an unseen finished agent");
+        assert_eq!(terminal.state, AgentState::Idle);
+    }
+
+    #[test]
+    fn idle_status_maps_to_seen_idle() {
+        let mut terminal = terminal();
+        let seen = project_pane_metadata(&mut terminal, &pane_info(AgentStatus::Idle));
+        assert!(seen);
+        assert_eq!(terminal.state, AgentState::Idle);
+    }
+
+    #[test]
+    fn pane_without_metadata_leaves_presentation_empty() {
+        let mut terminal = terminal();
+        let seen = project_pane_metadata(&mut terminal, &pane_info(AgentStatus::Unknown));
+        assert!(seen);
+        assert_eq!(terminal.state, AgentState::Unknown);
+        let presentation = terminal.effective_presentation();
+        assert_eq!(presentation.title, None);
+        assert_eq!(presentation.custom_status, None);
+        assert!(presentation.state_labels.is_empty());
+    }
+
+    fn workspace_info(worktree: Option<WorkspaceWorktreeInfo>) -> WorkspaceInfo {
+        WorkspaceInfo {
+            workspace_id: "w1".into(),
+            number: 1,
+            label: "main".into(),
+            focused: true,
+            pane_count: 1,
+            tab_count: 1,
+            active_tab_id: "tab1".into(),
+            agent_status: AgentStatus::Unknown,
+            branch: Some("feat/x".into()),
+            worktree,
+        }
+    }
+
+    #[test]
+    fn projects_branch_and_worktree_space() {
+        let info = workspace_info(Some(WorkspaceWorktreeInfo {
+            repo_key: "repo-key".into(),
+            repo_name: "herdr".into(),
+            repo_root: "/repo/herdr".into(),
+            checkout_path: "/repo/herdr-issue".into(),
+            is_linked_worktree: true,
+        }));
+
+        let projected = project_workspace_metadata(&info);
+
+        assert_eq!(projected.branch.as_deref(), Some("feat/x"));
+        let space = projected.worktree_space.expect("worktree space projected");
+        assert_eq!(space.key, "repo-key");
+        assert_eq!(space.label, "herdr");
+        assert_eq!(space.repo_root, std::path::PathBuf::from("/repo/herdr"));
+        assert_eq!(
+            space.checkout_path,
+            std::path::PathBuf::from("/repo/herdr-issue")
+        );
+        assert!(space.is_linked_worktree);
+    }
+
+    #[test]
+    fn workspace_without_worktree_has_no_space() {
+        let projected = project_workspace_metadata(&workspace_info(None));
+        assert!(projected.worktree_space.is_none());
+        assert_eq!(projected.branch.as_deref(), Some("feat/x"));
     }
 }

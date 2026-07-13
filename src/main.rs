@@ -525,6 +525,7 @@ fn main() -> io::Result<()> {
         println!("Usage: herdr [options]");
         println!("       herdr --session <name> [options]");
         println!("       herdr --remote <ssh-target> [--session <name>]");
+        println!("       herdr mirror <host> [ssh args ...]");
         println!("       herdr session attach <name>");
         println!("       herdr completion zsh");
         println!("       herdr update [--handoff]");
@@ -548,6 +549,10 @@ fn main() -> io::Result<()> {
         println!("Common commands:");
         for (command, description) in [
             ("herdr", "Launch or attach to the persistent session"),
+            (
+                "herdr mirror <host>",
+                "Mirror a remote host's session over SSH in one command",
+            ),
             (
                 "herdr status [server|client]",
                 "Show local client and running server status",

@@ -13,8 +13,11 @@ use crate::api::schema::{
 use crate::api::EventHub;
 use crate::app::App;
 use crate::config::Config;
+use crate::detect::{Agent, AgentState};
+use crate::terminal::{AgentMetadataReport, TerminalId, TerminalState};
 use crate::workspace::Workspace;
 
+use super::projection::project_pane_metadata;
 use super::{ReplicaChange, SessionReplica};
 
 /// A real app with one workspace, two tabs (one pane/terminal each) and runtime
@@ -60,6 +63,84 @@ fn replica_retrieves_pane_and_layout_state_from_server_snapshot() {
     for terminal_id in replica.terminal_ids() {
         assert!(replica.pane_for_terminal(&terminal_id).is_some());
     }
+}
+
+#[test]
+fn projected_pane_reproduces_server_agent_state_over_the_wire() {
+    let (mut app, _hub) = app_with_two_tabs();
+
+    // Drive one real server terminal into a rich agent state: Working, with a
+    // manual label and a custom status. This is exactly the state the sidebar
+    // agent panel, workspace dots, and border labels read from.
+    let terminal_id = app
+        .state
+        .terminals
+        .keys()
+        .next()
+        .expect("a terminal exists")
+        .clone();
+    {
+        let terminal = app
+            .state
+            .terminals
+            .get_mut(&terminal_id)
+            .expect("terminal present");
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Working);
+        terminal.set_agent_metadata(AgentMetadataReport {
+            source: "test".into(),
+            agent_label: None,
+            applies_to_source: None,
+            title: Some("running tests".into()),
+            display_agent: None,
+            custom_status: Some("87%".into()),
+            state_labels: Default::default(),
+            clear_title: false,
+            clear_display_agent: false,
+            clear_custom_status: false,
+            clear_state_labels: false,
+            ttl: None,
+            seq: None,
+        });
+        terminal.set_manual_label("worker".into());
+    }
+
+    let server_terminal = app.state.terminals.get(&terminal_id).unwrap();
+    let server_state = server_terminal.state;
+    let server_presentation = server_terminal.effective_presentation();
+    let server_label = server_terminal.manual_label.clone();
+    assert_eq!(server_state, AgentState::Working, "server drove Working");
+
+    // Take a real snapshot and reconcile it into a replica, exactly as the mirror
+    // client does — the agent state now travels the wire as `PaneInfo.agent_status`
+    // plus the presentation fields.
+    let replica = replica_from_response(&app.handle_api_request(Request {
+        id: "snapshot".into(),
+        method: Method::SessionSnapshot(EmptyParams::default()),
+    }));
+
+    let pane_info = replica
+        .pane_for_terminal(&terminal_id.to_string())
+        .expect("pane for the driven terminal");
+
+    // Project the wire pane back into a TerminalState, as the mirror render path
+    // does, and assert it reproduces what the server renderer would read.
+    let mut projected = TerminalState::new(TerminalId::alloc(), "/".into());
+    let seen = project_pane_metadata(&mut projected, pane_info);
+
+    assert!(seen, "Working projects as seen");
+    assert_eq!(
+        projected.state, server_state,
+        "projected agent state matches the server's"
+    );
+    assert_eq!(
+        projected.manual_label, server_label,
+        "projected manual label matches the server's"
+    );
+    assert_eq!(
+        projected.effective_presentation(),
+        server_presentation,
+        "projected effective presentation matches the server's"
+    );
 }
 
 #[test]
