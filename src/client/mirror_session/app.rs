@@ -558,6 +558,14 @@ impl MirrorApp {
     }
 
     fn focus_pane_for_input(&mut self, pane_id: String, terminal_id: &str) {
+        // Clicking or scrolling within the already-focused pane must not re-issue
+        // a focus handoff or a server mutation: a wheel burst would otherwise
+        // flood the control plane with one redundant `changes_ui` pane.focus
+        // request per tick. The data-plane `set_focus` already no-ops on an
+        // unchanged focus; this guard extends that to the control-plane mutation.
+        if self.data.focused() == Some(terminal_id) {
+            return;
+        }
         if let Err(err) = self.data.set_focus(Some(terminal_id)) {
             warn!(pane_id, terminal_id, err = %err, "mirror writable handoff for mouse target failed");
         }

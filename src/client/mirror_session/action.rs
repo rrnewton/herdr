@@ -278,6 +278,7 @@ mod tests {
             tab_count: 1,
             active_tab_id: "t1".into(),
             agent_status: AgentStatus::Unknown,
+            branch: None,
             worktree: None,
         }
     }

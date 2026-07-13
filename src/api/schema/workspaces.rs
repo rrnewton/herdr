@@ -54,6 +54,11 @@ pub struct WorkspaceInfo {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[schemars(schema_with = "super::common::metadata_token_values_schema")]
     pub tokens: HashMap<String, String>,
+    /// Current git branch of the workspace repo, when it is a git checkout. Lets
+    /// clients (e.g. the mirror TUI) render the same branch subtitle as the
+    /// server TUI without inspecting the filesystem themselves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<WorkspaceWorktreeInfo>,
 }

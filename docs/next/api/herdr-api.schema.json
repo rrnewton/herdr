@@ -1030,6 +1030,13 @@
             "agent_status": {
               "$ref": "#/schemas/event/$defs/AgentStatus"
             },
+            "branch": {
+              "description": "Current git branch of the workspace repo, when it is a git checkout. Lets\nclients (e.g. the mirror TUI) render the same branch subtitle as the\nserver TUI without inspecting the filesystem themselves.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "focused": {
               "type": "boolean"
             },
@@ -9174,6 +9181,13 @@
             },
             "agent_status": {
               "$ref": "#/schemas/success_response/$defs/AgentStatus"
+            },
+            "branch": {
+              "description": "Current git branch of the workspace repo, when it is a git checkout. Lets\nclients (e.g. the mirror TUI) render the same branch subtitle as the\nserver TUI without inspecting the filesystem themselves.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "focused": {
               "type": "boolean"

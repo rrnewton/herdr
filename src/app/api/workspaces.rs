@@ -519,6 +519,31 @@ mod tests {
     }
 
     #[test]
+    fn workspace_info_reports_cached_git_branch() {
+        // The mirror sidebar renders its branch subtitle from `WorkspaceInfo.branch`
+        // (a shared runtime fact exposed over the JSON API), so `workspace_info`
+        // must surface the workspace's cached git branch.
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        app.state.workspaces = vec![Workspace::test_new("ws")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.workspaces[0].cached_git_branch = Some("feature/mirror-branch".into());
+
+        let info = app.workspace_info(0);
+        assert_eq!(info.branch.as_deref(), Some("feature/mirror-branch"));
+
+        app.state.workspaces[0].cached_git_branch = None;
+        assert_eq!(app.workspace_info(0).branch, None);
+    }
+
+    #[test]
     fn api_workspace_move_reorders_workspaces() {
         let event_hub = crate::api::EventHub::default();
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();

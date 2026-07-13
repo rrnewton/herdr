@@ -117,6 +117,7 @@ pub(crate) fn rebuild_app_state(
             ws_info.workspace_id.clone(),
             Some(ws_info.label.clone()),
             identity_cwd,
+            ws_info.branch.clone(),
             projected_tabs,
             active_tab,
             public_pane_numbers,

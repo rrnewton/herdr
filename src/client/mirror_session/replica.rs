@@ -497,6 +497,7 @@ mod tests {
             tab_count: 1,
             active_tab_id: active_tab_id.into(),
             agent_status: AgentStatus::Unknown,
+            branch: None,
             worktree: None,
         }
     }

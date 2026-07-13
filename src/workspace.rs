@@ -1184,13 +1184,16 @@ pub(crate) struct TakenPane {
 #[cfg(unix)]
 impl Workspace {
     /// Builds a workspace for the client-side mirror replica from already-built
-    /// tabs (`design-mirror-tui.md` §2.3). Git metadata is left uncached (the
-    /// mirror shows the server's reported labels); it can be filled later.
+    /// tabs (`design-mirror-tui.md` §2.3). The git `branch` is supplied by the
+    /// server (via `WorkspaceInfo`) so the mirror renders the same branch subtitle
+    /// as the server TUI; the remaining git metadata (ahead/behind, space
+    /// grouping) is left uncached and can be filled later.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_mirror(
         id: String,
         custom_name: Option<String>,
         identity_cwd: PathBuf,
+        branch: Option<String>,
         tabs: Vec<Tab>,
         active_tab: usize,
         public_pane_numbers: HashMap<PaneId, usize>,
@@ -1201,7 +1204,7 @@ impl Workspace {
             id,
             custom_name,
             identity_cwd,
-            cached_git_branch: None,
+            cached_git_branch: branch,
             cached_git_ahead_behind: None,
             cached_git_space: None,
             worktree_space: None,
