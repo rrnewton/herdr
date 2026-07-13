@@ -30,7 +30,7 @@ const TERMINAL_SESSION_OBSERVE_USAGE: &str =
 const TERMINAL_SESSION_CONTROL_USAGE: &str =
     "usage: herdr terminal session control <target> [--takeover] [--cols N] [--rows N]";
 const TERMINAL_SESSION_MIRROR_USAGE: &str =
-    "usage: herdr terminal session mirror <target> [--resume-from SEQ] [--cols N] [--rows N]";
+    "usage: herdr terminal session mirror <target> [--json] [--resume-from SEQ] [--cols N] [--rows N]";
 
 pub(crate) fn parse_token_assignment(raw: &str) -> Result<(String, Option<String>), String> {
     let Some((key, value)) = raw.split_once('=') else {
@@ -598,9 +598,14 @@ fn terminal_session_mirror(args: &[String]) -> std::io::Result<i32> {
     let mut cols = 120;
     let mut rows = 40;
     let mut resume_from = None;
+    let mut json = false;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
+            "--json" => {
+                json = true;
+                i += 1;
+            }
             "--cols" => {
                 let Some(value) = args.get(i + 1) else {
                     eprintln!("{TERMINAL_SESSION_MIRROR_USAGE}");
@@ -641,7 +646,11 @@ fn terminal_session_mirror(args: &[String]) -> std::io::Result<i32> {
         }
     }
 
-    crate::client::run_terminal_session_mirror(target.clone(), cols, rows, resume_from)?;
+    if json {
+        crate::client::run_terminal_session_mirror_json(target.clone(), cols, rows, resume_from)?;
+    } else {
+        crate::client::run_terminal_session_mirror(target.clone(), cols, rows, resume_from)?;
+    }
     Ok(0)
 }
 

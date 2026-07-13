@@ -859,9 +859,8 @@ pub fn run_terminal_session_observe(target: String, cols: u16, rows: u16) -> io:
 ///
 /// This is the headless/machine-readable face of the responsive local mirror:
 /// it lets tools and tests consume the raw replication stream without a live
-/// TUI. A future interactive client will instead feed these events into a local
-/// terminal emulator.
-pub fn run_terminal_session_mirror(
+/// TUI, and backs `terminal session mirror --json`.
+pub fn run_terminal_session_mirror_json(
     target: String,
     cols: u16,
     rows: u16,
@@ -874,9 +873,396 @@ pub fn run_terminal_session_mirror(
         &ClientMessage::MirrorTerminal {
             target,
             resume_from,
+            writable: false,
         },
     )?;
     write_terminal_mirror_output(stream)
+}
+
+/// Runs the interactive local mirror: a full-screen client that maintains its
+/// own terminal emulator from the replicated stream and renders it locally, so
+/// scrollback (mouse wheel and page keys off the alternate screen) is instant
+/// with no server round-trip. Keystrokes are forwarded to the remote terminal.
+///
+/// If the connection drops (a flaky link), the client keeps the local mirror on
+/// screen and transparently reconnects, resuming the stream from where it left
+/// off. Detach with `ctrl+b q`.
+#[cfg(unix)]
+pub fn run_terminal_session_mirror(
+    target: String,
+    cli_cols: u16,
+    cli_rows: u16,
+    resume_from: Option<u64>,
+) -> io::Result<()> {
+    init_logging();
+    // The interactive mirror is a full-screen client, so it renders at the real
+    // terminal size, not the JSON-mode default. Fall back to the CLI values only
+    // when the size cannot be detected.
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((cli_cols, cli_rows));
+
+    // Connect once before entering the alt screen so connection errors print
+    // normally rather than into a full-screen UI we then have to tear down.
+    let first = connect_mirror_stream(&target, cols, rows, resume_from, true)?;
+
+    let _guard = setup_direct_attach_terminal()?;
+    let should_quit = Arc::new(AtomicBool::new(false));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(run_terminal_mirror_loop(
+        target,
+        cols,
+        rows,
+        first,
+        should_quit,
+    ));
+    result.map_err(|err| io::Error::other(err.to_string()))
+}
+
+/// Connects, handshakes, and subscribes a mirror stream, returning the ready
+/// stream. Unlike the JSON path this never exits the process, so it can be
+/// retried for transparent reconnect.
+#[cfg(unix)]
+fn connect_mirror_stream(
+    target: &str,
+    cols: u16,
+    rows: u16,
+    resume_from: Option<u64>,
+    writable: bool,
+) -> io::Result<LocalStream> {
+    let socket_path = client_socket_path();
+    let mut stream = crate::ipc::connect_local_stream(&socket_path)?;
+    match do_handshake(
+        &mut stream,
+        cols,
+        rows,
+        0,
+        0,
+        RenderEncoding::TerminalAnsi,
+        true,
+    ) {
+        Ok(_) => {}
+        Err(err) => return Err(io::Error::other(err.to_string())),
+    }
+    stream.set_nonblocking(false)?;
+    write_to_server(
+        &mut stream,
+        &ClientMessage::MirrorTerminal {
+            target: target.to_owned(),
+            resume_from,
+            writable,
+        },
+    )?;
+    Ok(stream)
+}
+
+/// Interactive mirror is Unix-only for now (it shares the direct-attach raw input
+/// path). Non-Unix falls back to the JSON stream.
+#[cfg(not(unix))]
+pub fn run_terminal_session_mirror(
+    target: String,
+    cols: u16,
+    rows: u16,
+    resume_from: Option<u64>,
+) -> io::Result<()> {
+    run_terminal_session_mirror_json(target, cols, rows, resume_from)
+}
+
+/// Outcome of one connected mirror session, deciding what the reconnect loop
+/// does next.
+#[cfg(unix)]
+enum MirrorSessionEnd {
+    /// The user detached or the terminal ended; stop.
+    Done,
+    /// The connection dropped; reconnect and resume.
+    Reconnect,
+}
+
+/// The interactive mirror driver: keeps the local emulator alive across
+/// reconnects, rendering and scrolling locally while the link is up or down.
+#[cfg(unix)]
+async fn run_terminal_mirror_loop(
+    target: String,
+    cols: u16,
+    rows: u16,
+    first_stream: LocalStream,
+    should_quit: Arc<AtomicBool>,
+) -> Result<(), ClientError> {
+    use crate::pane::LocalMirror;
+
+    let mut mirror = LocalMirror::new(cols, rows).map_err(ClientError::ConnectionFailed)?;
+    let mut escape = AttachEscapeState::default();
+    // Terminal rows moved per mouse-wheel notch during local scrollback.
+    let mouse_scroll_lines = 3usize;
+    let mut viewport_rows = rows;
+    let mut client_size = (cols, rows);
+
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<ClientLoopEvent>(256);
+
+    // stdin and resize threads live for the whole session, across reconnects.
+    let stdin_quit = should_quit.clone();
+    let stdin_tx = event_tx.clone();
+    let mouse_active = Arc::new(AtomicBool::new(true));
+    std::thread::spawn(move || {
+        input::stdin_reader_loop(stdin_tx, &stdin_quit, false, mouse_active);
+    });
+    let resize_quit = should_quit.clone();
+    let resize_tx = event_tx.clone();
+    std::thread::spawn(move || {
+        resize_poll_loop(resize_tx, cols, rows, false, &resize_quit);
+    });
+
+    let mut stream = Some(first_stream);
+    let mut backoff = Duration::from_millis(200);
+    while !should_quit.load(Ordering::Acquire) {
+        // Obtain a connected stream, reconnecting with resume on a dropped link.
+        let connected = match stream.take() {
+            Some(stream) => stream,
+            None => {
+                match connect_mirror_stream(
+                    &target,
+                    client_size.0,
+                    client_size.1,
+                    mirror.last_seq(),
+                    true,
+                ) {
+                    Ok(stream) => {
+                        backoff = Duration::from_millis(200);
+                        stream
+                    }
+                    Err(_) => {
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(Duration::from_secs(3));
+                        continue;
+                    }
+                }
+            }
+        };
+
+        let end = run_connected_mirror_session(
+            connected,
+            &mut mirror,
+            &mut escape,
+            &mut event_rx,
+            &should_quit,
+            mouse_scroll_lines,
+            &mut viewport_rows,
+            &mut client_size,
+        )
+        .await?;
+        match end {
+            MirrorSessionEnd::Done => break,
+            MirrorSessionEnd::Reconnect => continue,
+        }
+    }
+    Ok(())
+}
+
+/// Runs one connected mirror session until the link drops or the user leaves.
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+async fn run_connected_mirror_session(
+    stream: LocalStream,
+    mirror: &mut crate::pane::LocalMirror,
+    escape: &mut AttachEscapeState,
+    event_rx: &mut tokio::sync::mpsc::Receiver<ClientLoopEvent>,
+    should_quit: &Arc<AtomicBool>,
+    mouse_scroll_lines: usize,
+    viewport_rows: &mut u16,
+    client_size: &mut (u16, u16),
+) -> Result<MirrorSessionEnd, ClientError> {
+    let mut blit = render_ansi::BlitEncoder::new();
+
+    // Per-connection server reader thread.
+    let server_quit = should_quit.clone();
+    let (server_tx, mut merged_rx) = tokio::sync::mpsc::channel::<ClientLoopEvent>(256);
+    let read_stream = stream.try_clone().map_err(ClientError::ConnectionFailed)?;
+    let reader = std::thread::spawn(move || {
+        server_reader_thread(read_stream, server_tx, &server_quit, MAX_FRAME_SIZE);
+    });
+
+    let mut write_stream = stream;
+    write_stream
+        .set_nonblocking(false)
+        .map_err(ClientError::ConnectionFailed)?;
+
+    // Sync the source terminal to our size, then repaint from current state.
+    let _ = write_to_server(
+        &mut write_stream,
+        &ClientMessage::Resize {
+            cols: client_size.0,
+            rows: client_size.1,
+            cell_width_px: 0,
+            cell_height_px: 0,
+        },
+    );
+    repaint_mirror(mirror, &mut blit, true)?;
+
+    let end = loop {
+        if should_quit.load(Ordering::Acquire) {
+            break MirrorSessionEnd::Done;
+        }
+        // Local input/resize events arrive on event_rx; server messages on
+        // merged_rx. Whichever is ready drives the loop.
+        let event = tokio::select! {
+            ev = event_rx.recv() => ev.unwrap_or(ClientLoopEvent::Timer),
+            ev = merged_rx.recv() => ev.unwrap_or(ClientLoopEvent::ServerDisconnected),
+            _ = tokio::time::sleep(Duration::from_millis(100)) => ClientLoopEvent::Timer,
+        };
+
+        match event {
+            #[cfg(unix)]
+            ClientLoopEvent::StdinInput(data) => {
+                match escape.filter_input(data, *viewport_rows, mouse_scroll_lines) {
+                    AttachInputAction::Forward(bytes) => {
+                        if mirror.is_scrolled_back() {
+                            mirror.scroll_to_bottom();
+                            repaint_mirror(mirror, &mut blit, false)?;
+                        }
+                        let _ = write_to_server(
+                            &mut write_stream,
+                            &ClientMessage::Input { data: bytes },
+                        );
+                    }
+                    AttachInputAction::Scroll {
+                        source,
+                        direction,
+                        lines,
+                        ..
+                    } => {
+                        let handle_locally = match &source {
+                            AttachScrollSource::Wheel => true,
+                            AttachScrollSource::PageKey { .. } => !mirror.is_alt_screen(),
+                        };
+                        if handle_locally {
+                            match direction {
+                                AttachScrollDirection::Up => mirror.scroll_up(lines as usize),
+                                AttachScrollDirection::Down => mirror.scroll_down(lines as usize),
+                            }
+                            repaint_mirror(mirror, &mut blit, false)?;
+                        } else if let AttachScrollSource::PageKey { input } = source {
+                            let _ = write_to_server(
+                                &mut write_stream,
+                                &ClientMessage::Input { data: input },
+                            );
+                        }
+                    }
+                    AttachInputAction::Detach => {
+                        let _ = write_to_server(&mut write_stream, &ClientMessage::Detach);
+                        break MirrorSessionEnd::Done;
+                    }
+                    AttachInputAction::None => {}
+                }
+            }
+            #[cfg(windows)]
+            ClientLoopEvent::StdinEvents(_) => {}
+            ClientLoopEvent::Resize(new_cols, new_rows, cell_width_px, cell_height_px) => {
+                *viewport_rows = new_rows;
+                *client_size = (new_cols, new_rows);
+                let _ = write_to_server(
+                    &mut write_stream,
+                    &ClientMessage::Resize {
+                        cols: new_cols,
+                        rows: new_rows,
+                        cell_width_px,
+                        cell_height_px,
+                    },
+                );
+                blit = render_ansi::BlitEncoder::new();
+            }
+            ClientLoopEvent::ServerMessage(ServerMessage::MirrorSnapshot {
+                base_seq,
+                cols: src_cols,
+                rows: src_rows,
+            }) => {
+                let outcome = mirror
+                    .apply_snapshot(base_seq, src_cols, src_rows)
+                    .map_err(ClientError::ConnectionFailed)?;
+                repaint_mirror(mirror, &mut blit, outcome.needs_full_redraw)?;
+            }
+            ClientLoopEvent::ServerMessage(ServerMessage::MirrorEvent { seq, kind }) => {
+                let mut outcome = mirror.apply_event(seq, kind);
+                // Coalesce a burst of pending events (e.g. the initial history
+                // replay) into a single repaint to avoid flicker and wasted work.
+                while !outcome.closed {
+                    match merged_rx.try_recv() {
+                        Ok(ClientLoopEvent::ServerMessage(ServerMessage::MirrorEvent {
+                            seq,
+                            kind,
+                        })) => {
+                            let next = mirror.apply_event(seq, kind);
+                            outcome.needs_full_redraw |= next.needs_full_redraw;
+                            outcome.closed |= next.closed;
+                        }
+                        Ok(ClientLoopEvent::ServerMessage(ServerMessage::MirrorSnapshot {
+                            base_seq,
+                            cols: src_cols,
+                            rows: src_rows,
+                        })) => {
+                            let next = mirror
+                                .apply_snapshot(base_seq, src_cols, src_rows)
+                                .map_err(ClientError::ConnectionFailed)?;
+                            outcome.needs_full_redraw |= next.needs_full_redraw;
+                        }
+                        Ok(ClientLoopEvent::ServerMessage(ServerMessage::ServerShutdown {
+                            ..
+                        })) => {
+                            outcome.closed = true;
+                        }
+                        // Anything else (or an empty/closed queue): stop draining
+                        // and let the next loop iteration handle it.
+                        _ => break,
+                    }
+                }
+                if outcome.closed {
+                    break MirrorSessionEnd::Done;
+                }
+                if outcome.needs_full_redraw || !mirror.is_scrolled_back() {
+                    repaint_mirror(mirror, &mut blit, outcome.needs_full_redraw)?;
+                }
+            }
+            ClientLoopEvent::ServerMessage(ServerMessage::ServerShutdown { .. }) => {
+                break MirrorSessionEnd::Done;
+            }
+            ClientLoopEvent::ServerMessage(_) => {}
+            ClientLoopEvent::ServerDisconnected => break MirrorSessionEnd::Reconnect,
+            ClientLoopEvent::Timer => {}
+        }
+    };
+
+    // Tear down this connection's writer. On reconnect the reader has already
+    // exited (it emitted ServerDisconnected), so join it; on a clean exit the
+    // reader may still be blocked on a read, so abandon it — it dies with the
+    // process when the command returns.
+    drop(write_stream);
+    match end {
+        MirrorSessionEnd::Reconnect => {
+            let _ = reader.join();
+        }
+        MirrorSessionEnd::Done => {}
+    }
+    Ok(end)
+}
+
+/// Renders the mirror's current viewport and writes the diff to stdout.
+#[cfg(unix)]
+fn repaint_mirror(
+    mirror: &crate::pane::LocalMirror,
+    blit: &mut render_ansi::BlitEncoder,
+    full_redraw: bool,
+) -> Result<(), ClientError> {
+    if full_redraw {
+        *blit = render_ansi::BlitEncoder::new();
+    }
+    let frame = mirror.render_frame();
+    let encoded = blit.encode(&frame, false);
+    let mut stdout = io::stdout();
+    stdout
+        .write_all(&encoded.bytes)
+        .map_err(ClientError::ConnectionLost)?;
+    stdout.flush().map_err(ClientError::ConnectionLost)?;
+    blit.commit(frame, encoded);
+    Ok(())
 }
 
 /// Runs a writable terminal session controller.

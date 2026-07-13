@@ -27,6 +27,10 @@ mod agent_detection;
 mod cursor;
 mod input;
 mod kitty_keyboard;
+// The interactive local mirror client (and its emulator) is Unix-only for now,
+// sharing the direct-attach raw input path.
+#[cfg(unix)]
+mod mirror;
 mod osc;
 mod state;
 mod terminal;
@@ -39,6 +43,8 @@ use self::agent_detection::{
     DetectionScreenReadInput, PendingIdleConfirmation, ScreenDetectionPublishInput,
     AGENT_PENDING_IDLE_RECHECK, AGENT_STARTUP_GRACE_WINDOW,
 };
+#[cfg(unix)]
+pub(crate) use self::mirror::LocalMirror;
 use self::terminal::{GhosttyPaneTerminal, PaneTerminal};
 pub(crate) use self::terminal::{
     TerminalDirtyPatch, TerminalDirtyPatchOutcome, TerminalTextMatch, TerminalTextPoint,

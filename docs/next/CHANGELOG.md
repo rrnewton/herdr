@@ -3,7 +3,7 @@
 ## Unreleased
 
 ### Added
-- Added `herdr terminal session mirror <target>` for a responsive local mirror: instead of streaming server-rendered frames, it replicates a terminal's raw PTY output plus resize events with durable sequence numbers, so a consumer can maintain terminal state locally and scroll, search, and select without server round-trips. Supports `--resume-from SEQ` for gap-free reconnect over unreliable links. Emits newline-delimited JSON (`mirror.snapshot`, `mirror.event`, `mirror.closed`).
+- Added `herdr terminal session mirror <target>`, a responsive local mirror: instead of streaming server-rendered frames, it replicates a terminal's raw PTY output plus resize events with durable sequence numbers and keeps a terminal emulator locally on the client. By default it is a full-screen interactive client where scrollback (mouse wheel and page keys off the alternate screen) is instant with no server round-trip, keystrokes are forwarded, and dropped connections transparently reconnect and resume — keeping scrolling fast on high-latency links. `--json` emits the raw stream as newline-delimited JSON (`mirror.snapshot`, `mirror.event`, `mirror.closed`) for tools; `--resume-from SEQ` resumes a previous stream.
 
 ### Changed
 - Bumped the client/server protocol version to 17 for the terminal mirror stream.

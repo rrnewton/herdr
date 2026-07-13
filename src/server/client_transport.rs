@@ -339,11 +339,12 @@ pub(crate) enum ServerEvent {
         target: String,
         takeover: bool,
     },
-    /// A client requested a read-only raw-output mirror of one terminal.
+    /// A client requested a raw-output mirror of one terminal.
     ClientMirrorTerminal {
         client_id: u64,
         target: String,
         resume_from: Option<u64>,
+        writable: bool,
     },
     /// A direct terminal attach client requested scrollback movement.
     ClientAttachScroll {
@@ -714,10 +715,12 @@ fn client_read_loop(
             ClientMessage::MirrorTerminal {
                 target,
                 resume_from,
+                writable,
             } => ServerEvent::ClientMirrorTerminal {
                 client_id,
                 target,
                 resume_from,
+                writable,
             },
             ClientMessage::ClipboardImage { extension, data } => {
                 if data.len() > MAX_CLIPBOARD_IMAGE_PAYLOAD {

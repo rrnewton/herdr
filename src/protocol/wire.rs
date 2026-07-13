@@ -414,6 +414,10 @@ pub enum ClientMessage {
         /// resuming a previous stream. `None` requests a fresh replay from the
         /// oldest retained output.
         resume_from: Option<u64>,
+        /// When true, the client's keystrokes are forwarded to the mirrored
+        /// terminal (an interactive local mirror). When false, the stream is
+        /// read-only (a passive viewer or bridge).
+        writable: bool,
     },
 }
 
@@ -1114,6 +1118,7 @@ mod tests {
             tag(&ClientMessage::MirrorTerminal {
                 target: "w1:p1".to_owned(),
                 resume_from: None,
+                writable: false,
             }),
             10
         );
@@ -1269,10 +1274,11 @@ mod tests {
 
     #[test]
     fn client_mirror_terminal_roundtrip() {
-        for resume_from in [None, Some(0), Some(u64::MAX)] {
+        for (resume_from, writable) in [(None, false), (Some(0), true), (Some(u64::MAX), false)] {
             let msg = ClientMessage::MirrorTerminal {
                 target: "w1:p1".to_owned(),
                 resume_from,
+                writable,
             };
             let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
             let (decoded, _): (ClientMessage, _) =

@@ -1720,6 +1720,7 @@ impl HeadlessServer {
         client_id: u64,
         target: String,
         resume_from: Option<u64>,
+        writable: bool,
     ) -> bool {
         let Some(terminal_id) = self.resolve_terminal_session_target(client_id, &target, "mirror")
         else {
@@ -1752,6 +1753,7 @@ impl HeadlessServer {
         client.pending_terminal_attach = false;
         client.last_activity = stamp;
         client.mirror_last_sent_seq = resume_from;
+        client.mirror_writable = writable;
         let was_foreground = self.foreground_client_id == Some(client_id);
         if was_foreground {
             self.promote_latest_remaining_client();
@@ -2905,7 +2907,8 @@ impl HeadlessServer {
                 client_id,
                 target,
                 resume_from,
-            } => self.mirror_terminal_client(client_id, target, resume_from),
+                writable,
+            } => self.mirror_terminal_client(client_id, target, resume_from, writable),
             ServerEvent::ClientAttachScroll {
                 client_id,
                 source,
@@ -2935,6 +2938,24 @@ impl HeadlessServer {
                     if let Some(runtime) = self.runtime_for_terminal_id_string(terminal_id) {
                         if let Err(err) = apply_terminal_attach_input(runtime, data) {
                             warn!(client_id, terminal_id = %terminal_id, err = %err);
+                        }
+                    }
+                    return true;
+                }
+                // An interactive (writable) mirror forwards its keystrokes to the
+                // mirrored terminal; a read-only mirror or observer ignores input.
+                let writable_mirror_terminal = match self.clients.get(&client_id) {
+                    Some(ClientConnection {
+                        mode: ClientConnectionMode::TerminalMirror { terminal_id },
+                        mirror_writable: true,
+                        ..
+                    }) => Some(terminal_id.clone()),
+                    _ => None,
+                };
+                if let Some(terminal_id) = writable_mirror_terminal {
+                    if let Some(runtime) = self.runtime_for_terminal_id_string(&terminal_id) {
+                        if let Err(err) = apply_terminal_attach_input(runtime, data) {
+                            warn!(client_id, terminal_id = %terminal_id, err = %err, "mirror input failed");
                         }
                     }
                     return true;
@@ -3068,19 +3089,46 @@ impl HeadlessServer {
                     render_state.reset_baseline();
                     return true;
                 }
-                // A mirror client follows the source terminal's size and reflows
-                // locally, so its own resize never drives the shared runtime.
-                if matches!(
-                    self.clients.get(&client_id).map(|client| &client.mode),
-                    Some(ClientConnectionMode::TerminalMirror { .. })
-                ) {
-                    if let Some(client) = self.clients.get_mut(&client_id) {
+                // A writable (interactive) mirror drives the source terminal size
+                // so the remote session matches the client; the resize then flows
+                // back through the mirror stream. A read-only mirror follows the
+                // source size and only records its own size.
+                let mirror_terminal = match self.clients.get_mut(&client_id) {
+                    Some(
+                        client @ ClientConnection {
+                            mode: ClientConnectionMode::TerminalMirror { .. },
+                            ..
+                        },
+                    ) => {
                         client.terminal_size = (cols, rows);
                         client.cell_size = crate::kitty_graphics::HostCellSize {
                             width_px: cell_width_px,
                             height_px: cell_height_px,
                         };
+                        if client.mirror_writable {
+                            if let ClientConnectionMode::TerminalMirror { terminal_id } =
+                                &client.mode
+                            {
+                                Some(terminal_id.clone())
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
                     }
+                    _ => None,
+                };
+                if let Some(terminal_id) = mirror_terminal {
+                    if let Some(runtime) = self.runtime_for_terminal_id_string(&terminal_id) {
+                        runtime.resize(rows, cols, cell_width_px, cell_height_px);
+                    }
+                    return true;
+                }
+                if matches!(
+                    self.clients.get(&client_id).map(|client| &client.mode),
+                    Some(ClientConnectionMode::TerminalMirror { .. })
+                ) {
                     return false;
                 }
                 if let Some(client) = self.clients.get_mut(&client_id) {

@@ -79,6 +79,9 @@ pub(crate) struct ClientConnection {
     /// For a `TerminalMirror` client, the highest mirror sequence already sent to
     /// it. The server streams events with a greater sequence on each flush.
     pub(crate) mirror_last_sent_seq: Option<u64>,
+    /// For a `TerminalMirror` client, whether its keystrokes are forwarded to the
+    /// mirrored terminal (an interactive mirror) rather than being ignored.
+    pub(crate) mirror_writable: bool,
     /// Channels for sending framed ServerMessage data to the client writer thread.
     pub(crate) writer: Option<ClientWriter>,
 }
@@ -142,6 +145,7 @@ impl ClientConnection {
             host_mouse_capture_active: None,
             staged_clipboard_files: Vec::new(),
             mirror_last_sent_seq: None,
+            mirror_writable: false,
             writer,
         }
     }

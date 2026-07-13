@@ -141,8 +141,13 @@ fn pane_send_text(socket_path: &Path, pane_id: &str, text: &str) {
     );
 }
 
-/// Sends `ClientMessage::MirrorTerminal { target, resume_from }`.
-fn send_mirror_terminal(stream: &mut UnixStream, target: &str, resume_from: Option<u64>) {
+/// Sends `ClientMessage::MirrorTerminal { target, resume_from, writable }`.
+fn send_mirror_terminal(
+    stream: &mut UnixStream,
+    target: &str,
+    resume_from: Option<u64>,
+    writable: bool,
+) {
     let mut payload = encode_varint_u32(MSG_MIRROR_TERMINAL);
     payload.extend(encode_varint_u32(target.len() as u32));
     payload.extend_from_slice(target.as_bytes());
@@ -159,6 +164,7 @@ fn send_mirror_terminal(stream: &mut UnixStream, target: &str, resume_from: Opti
             }
         }
     }
+    payload.push(if writable { 1 } else { 0 });
     let framed = frame_message(&payload);
     stream.write_all(&framed).unwrap();
     stream.flush().unwrap();
@@ -293,7 +299,7 @@ fn mirror_streams_raw_output_with_contiguous_seqs() {
     assert_eq!(version, CURRENT_PROTOCOL);
     assert!(error.is_none(), "handshake error: {error:?}");
 
-    send_mirror_terminal(&mut stream, &pane_id, None);
+    send_mirror_terminal(&mut stream, &pane_id, None, false);
 
     // First message must be the snapshot establishing base_seq.
     stream
@@ -341,7 +347,7 @@ fn mirror_resume_continues_without_gap() {
         let (version, _) =
             client_handshake_direct(&mut stream, CURRENT_PROTOCOL, 80, 24).expect("handshake");
         assert_eq!(version, CURRENT_PROTOCOL);
-        send_mirror_terminal(&mut stream, &pane_id, None);
+        send_mirror_terminal(&mut stream, &pane_id, None, false);
 
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
@@ -368,7 +374,7 @@ fn mirror_resume_continues_without_gap() {
     let (version, _) =
         client_handshake_direct(&mut stream, CURRENT_PROTOCOL, 80, 24).expect("handshake");
     assert_eq!(version, CURRENT_PROTOCOL);
-    send_mirror_terminal(&mut stream, &pane_id, Some(resume_point));
+    send_mirror_terminal(&mut stream, &pane_id, Some(resume_point), false);
 
     // A covered resume delivers events directly (no re-snapshot), contiguous
     // from resume_point + 1, and eventually carries the second marker.
