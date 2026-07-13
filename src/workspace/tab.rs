@@ -52,6 +52,39 @@ pub struct Tab {
 }
 
 impl Tab {
+    /// Builds a tab for the client-side mirror replica from already-projected
+    /// pieces (`design-mirror-tui.md` §2.3). No PTYs are spawned: `panes` carry
+    /// only `PaneState`, and live content is rendered from the mirror registry.
+    /// The `events`/`render_notify`/`render_dirty` handles are shared, unused
+    /// dummies (the replica has no server services to notify).
+    #[cfg(unix)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_mirror(
+        custom_name: Option<String>,
+        number: usize,
+        root_pane: PaneId,
+        layout: TileLayout,
+        panes: HashMap<PaneId, PaneState>,
+        zoomed: bool,
+        events: mpsc::Sender<AppEvent>,
+        render_notify: Arc<Notify>,
+        render_dirty: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            custom_name,
+            number,
+            root_pane,
+            layout,
+            panes,
+            #[cfg(test)]
+            runtimes: HashMap::new(),
+            zoomed,
+            events,
+            render_notify,
+            render_dirty,
+        }
+    }
+
     pub fn new(
         number: usize,
         initial_cwd: PathBuf,

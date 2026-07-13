@@ -46,6 +46,10 @@ mod settings;
 mod sidebar;
 mod terminal;
 
+#[cfg(unix)]
+pub(crate) use self::navigate::{
+    prefix_indexed_navigation_action, prefix_non_indexed_navigation_action, NavigateAction,
+};
 pub(crate) use self::{
     modal::{
         handle_global_menu_key, handle_keybind_help_key, handle_navigator_key,

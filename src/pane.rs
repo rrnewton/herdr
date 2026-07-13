@@ -44,7 +44,7 @@ use self::agent_detection::{
     AGENT_PENDING_IDLE_RECHECK, AGENT_STARTUP_GRACE_WINDOW,
 };
 #[cfg(unix)]
-pub(crate) use self::mirror::LocalMirror;
+pub(crate) use self::mirror::{LocalMirror, MirrorApplyOutcome, MirrorRuntime};
 use self::terminal::{GhosttyPaneTerminal, PaneTerminal};
 pub(crate) use self::terminal::{
     TerminalDirtyPatch, TerminalDirtyPatchOutcome, TerminalTextMatch, TerminalTextPoint,

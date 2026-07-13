@@ -378,15 +378,22 @@ impl App {
         let pane = ws.pane_state(pane_id)?;
         let terminal = self.state.terminals.get(&pane.attached_terminal_id)?;
         let tab_idx = ws.find_tab_index_for_pane(pane_id)?;
-        let scroll = self
-            .state
-            .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id)
+        let runtime =
+            self.state
+                .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id);
+        let scroll = runtime
             .and_then(|runtime| runtime.scroll_metrics())
             .map(|metrics| crate::api::schema::PaneScrollInfo {
                 offset_from_bottom: metrics.offset_from_bottom as u64,
                 max_offset_from_bottom: metrics.max_offset_from_bottom as u64,
                 viewport_rows: metrics.viewport_rows as u64,
             });
+        // `current_size` is `(rows, cols)`; expose the pane's live terminal size
+        // so any client can render/verify pane geometry without the TUI socket.
+        let (rows, cols) = match runtime.map(|runtime| runtime.current_size()) {
+            Some((rows, cols)) => (Some(rows), Some(cols)),
+            None => (None, None),
+        };
         let focused = self.state.active == Some(ws_idx)
             && ws.active_tab == tab_idx
             && ws
@@ -399,6 +406,8 @@ impl App {
             workspace_id: self.public_workspace_id(ws_idx),
             tab_id: self.public_tab_id(ws_idx, tab_idx)?,
             focused,
+            cols,
+            rows,
             cwd: ws.tabs[tab_idx]
                 .cwd_for_pane(pane_id, &self.state.terminals, &self.terminal_runtimes)
                 .map(|cwd| cwd.display().to_string()),

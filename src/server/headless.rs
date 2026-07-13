@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyModifiers, MouseEventKind};
+use crossterm::event::{KeyCode, KeyModifiers, MouseEventKind};
 use interprocess::local_socket::traits::Listener as _;
 #[cfg(windows)]
 use interprocess::local_socket::traits::Stream as _;
@@ -360,6 +360,88 @@ fn apply_terminal_attach_input(
     runtime
         .try_send_bytes(Bytes::from(data))
         .map_err(|err| format!("terminal attach input failed: {err}"))
+}
+
+fn apply_terminal_attach_input_event(
+    runtime: &crate::terminal::TerminalRuntime,
+    event: &crate::protocol::ClientInputEvent,
+) -> Result<(), String> {
+    match event.to_raw_input_event() {
+        crate::raw_input::RawInputEvent::Key(key) => {
+            let key_event = key.as_key_event();
+            if key_event.kind == crossterm::event::KeyEventKind::Release
+                || matches!(key_event.code, KeyCode::Modifier(_))
+            {
+                return Ok(());
+            }
+            let bytes = runtime.encode_terminal_key(key);
+            if bytes.is_empty() {
+                return Ok(());
+            }
+            apply_terminal_attach_input(runtime, bytes)
+        }
+        crate::raw_input::RawInputEvent::Paste(text) => {
+            let data = if runtime
+                .input_state()
+                .map(|state| state.bracketed_paste)
+                .unwrap_or(false)
+            {
+                format!("\x1b[200~{text}\x1b[201~").into_bytes()
+            } else {
+                text.into_bytes()
+            };
+            apply_terminal_attach_input(runtime, data)
+        }
+        crate::raw_input::RawInputEvent::Mouse(mouse) => match mouse.kind {
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => apply_terminal_attach_scroll(
+                runtime,
+                AttachScrollSource::Wheel,
+                if matches!(mouse.kind, MouseEventKind::ScrollUp) {
+                    AttachScrollDirection::Up
+                } else {
+                    AttachScrollDirection::Down
+                },
+                3,
+                Some(mouse.column),
+                Some(mouse.row),
+                mouse.modifiers.bits(),
+            ),
+            MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight => Ok(()),
+            MouseEventKind::Down(_) | MouseEventKind::Up(_) | MouseEventKind::Drag(_) => {
+                let Some(bytes) = runtime.encode_mouse_button(
+                    mouse.kind,
+                    mouse.column,
+                    mouse.row,
+                    mouse.modifiers,
+                ) else {
+                    return Ok(());
+                };
+                apply_terminal_attach_input(runtime, bytes)
+            }
+            MouseEventKind::Moved => {
+                let Some(bytes) = runtime.encode_mouse_motion(
+                    mouse.kind,
+                    mouse.column,
+                    mouse.row,
+                    mouse.modifiers,
+                ) else {
+                    return Ok(());
+                };
+                apply_terminal_attach_input(runtime, bytes)
+            }
+        },
+        _ => Ok(()),
+    }
+}
+
+fn apply_terminal_attach_input_events(
+    runtime: &crate::terminal::TerminalRuntime,
+    events: &[crate::protocol::ClientInputEvent],
+) -> Result<(), String> {
+    for event in events {
+        apply_terminal_attach_input_event(runtime, event)?;
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -1722,6 +1804,21 @@ impl HeadlessServer {
         resume_from: Option<u64>,
         writable: bool,
     ) -> bool {
+        // Re-subscription on an already-connected mirror connection: the client
+        // changes the writable bit (focus handoff) or resumes from a new sequence
+        // (reconnect) on the *same* connection without tearing it down, exactly as
+        // `client::mirror_session::connection::resubscribe` does per
+        // `design-mirror-tui.md` §2.2/§2.4. Such a connection is no longer in the
+        // pending-`App` state the initial-subscribe path requires, so route it to
+        // an in-place update instead of the pending-mode gate (which would reject
+        // it and drop the connection, breaking multi-pane focus/input and resume).
+        if matches!(
+            self.clients.get(&client_id).map(|client| &client.mode),
+            Some(ClientConnectionMode::TerminalMirror { .. })
+        ) {
+            return self.resubscribe_mirror_terminal_client(client_id, resume_from, writable);
+        }
+
         let Some(terminal_id) = self.resolve_terminal_session_target(client_id, &target, "mirror")
         else {
             return false;
@@ -1764,6 +1861,57 @@ impl HeadlessServer {
 
         // Deliver the initial snapshot (or resume delta) immediately; the run
         // loop tails the rest via stream_mirror_updates.
+        self.flush_mirror_client(client_id, &output_log, resume_from);
+        true
+    }
+
+    /// Updates an already-connected mirror connection in place for a re-subscribe:
+    /// moves the writable bit (focus handoff) and/or resumes from a new sequence
+    /// (reconnect), then re-flushes from that point. Unlike the initial subscribe
+    /// it does not re-register the connection as a new subscriber (it already is)
+    /// nor require the pending-`App` state; the connection keeps mirroring the
+    /// terminal it was bound to.
+    fn resubscribe_mirror_terminal_client(
+        &mut self,
+        client_id: u64,
+        resume_from: Option<u64>,
+        writable: bool,
+    ) -> bool {
+        let Some(ClientConnectionMode::TerminalMirror { terminal_id }) = self
+            .clients
+            .get(&client_id)
+            .map(|client| client.mode.clone())
+        else {
+            return false;
+        };
+
+        let Some(output_log) = self
+            .runtime_for_terminal_id_string(&terminal_id)
+            .map(|runtime| runtime.output_log())
+        else {
+            self.send_to_client(
+                client_id,
+                ServerMessage::ServerShutdown {
+                    reason: Some(format!(
+                        "terminal session mirror failed: terminal {terminal_id} has no live runtime"
+                    )),
+                },
+            );
+            self.remove_client_and_resize_if_needed(client_id);
+            return false;
+        };
+
+        let stamp = self.allocate_activity_stamp();
+        let Some(client) = self.clients.get_mut(&client_id) else {
+            return false;
+        };
+        client.last_activity = stamp;
+        client.mirror_last_sent_seq = resume_from;
+        client.mirror_writable = writable;
+
+        // Already a subscriber on this terminal's log — do not add again. Re-flush
+        // from the (new) resume point, which is a cheap covered delta in the
+        // common focus-handoff case (resume_from == the client's last applied seq).
         self.flush_mirror_client(client_id, &output_log, resume_from);
         true
     }
@@ -2995,6 +3143,26 @@ impl HeadlessServer {
                     len = events.len(),
                     "client input events received"
                 );
+                let direct_terminal = match self.clients.get(&client_id) {
+                    Some(ClientConnection {
+                        mode: ClientConnectionMode::TerminalAttach { terminal_id },
+                        ..
+                    }) => Some(terminal_id.clone()),
+                    Some(ClientConnection {
+                        mode: ClientConnectionMode::TerminalMirror { terminal_id },
+                        mirror_writable: true,
+                        ..
+                    }) => Some(terminal_id.clone()),
+                    _ => None,
+                };
+                if let Some(terminal_id) = direct_terminal {
+                    if let Some(runtime) = self.runtime_for_terminal_id_string(&terminal_id) {
+                        if let Err(err) = apply_terminal_attach_input_events(runtime, &events) {
+                            warn!(client_id, terminal_id = %terminal_id, err = %err, "terminal input events failed");
+                        }
+                    }
+                    return true;
+                }
                 if matches!(
                     self.clients.get(&client_id).map(|client| &client.mode),
                     Some(
@@ -5388,6 +5556,77 @@ next_tab = ""
             writer,
         }));
         control_rx
+    }
+
+    #[test]
+    fn mirror_resubscribe_updates_writable_in_place_without_dropping_connection() {
+        // Regression guard for the multi-pane mirror focus-handoff / resume path:
+        // the client re-subscribes an already-connected mirror connection (a second
+        // `MirrorTerminal`) to move the writable bit or resume. The server must
+        // update it in place, NOT reject it as "not pending" and drop the
+        // connection (which broke all multi-pane input/focus; only E2E caught it).
+        with_terminal_session_test_server(|server, _terminal_id, terminal_id_string, _| {
+            // Keep the control receiver alive so snapshot/delta flushes to this
+            // client succeed (dropping it would fail the send and evict the client).
+            let _control_rx = connect_pending_terminal_client_with_control_rx(server, 7);
+
+            // Initial read-only subscribe: the connection becomes a mirror.
+            assert!(
+                server.handle_server_event(ServerEvent::ClientMirrorTerminal {
+                    client_id: 7,
+                    target: terminal_id_string.clone(),
+                    resume_from: None,
+                    writable: false,
+                })
+            );
+            assert!(matches!(
+                server.clients.get(&7).map(|client| &client.mode),
+                Some(ClientConnectionMode::TerminalMirror { .. })
+            ));
+            assert_eq!(
+                server.clients.get(&7).map(|client| client.mirror_writable),
+                Some(false)
+            );
+
+            // Re-subscribe on the SAME connection to promote to writable (focus
+            // handoff). The connection must survive and update in place.
+            assert!(
+                server.handle_server_event(ServerEvent::ClientMirrorTerminal {
+                    client_id: 7,
+                    target: terminal_id_string.clone(),
+                    resume_from: None,
+                    writable: true,
+                })
+            );
+            assert!(
+                server.clients.contains_key(&7),
+                "re-subscribe must not drop the mirror connection"
+            );
+            assert!(matches!(
+                server.clients.get(&7).map(|client| &client.mode),
+                Some(ClientConnectionMode::TerminalMirror { .. })
+            ));
+            assert_eq!(
+                server.clients.get(&7).map(|client| client.mirror_writable),
+                Some(true),
+                "re-subscribe must move the writable bit in place"
+            );
+
+            // And a subsequent demote (focus moving away) also updates in place.
+            assert!(
+                server.handle_server_event(ServerEvent::ClientMirrorTerminal {
+                    client_id: 7,
+                    target: terminal_id_string.clone(),
+                    resume_from: None,
+                    writable: false,
+                })
+            );
+            assert!(server.clients.contains_key(&7));
+            assert_eq!(
+                server.clients.get(&7).map(|client| client.mirror_writable),
+                Some(false)
+            );
+        });
     }
 
     #[test]

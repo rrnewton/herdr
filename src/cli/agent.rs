@@ -502,17 +502,17 @@ fn agent_wait(args: &[String]) -> std::io::Result<i32> {
     let subscriptions = if agent_status == AgentStatus::Idle {
         vec![
             Subscription::PaneAgentStatusChanged {
-                pane_id: pane_id.to_owned(),
+                pane_id: Some(pane_id.to_owned()),
                 agent_status: Some(AgentStatus::Idle),
             },
             Subscription::PaneAgentStatusChanged {
-                pane_id: pane_id.to_owned(),
+                pane_id: Some(pane_id.to_owned()),
                 agent_status: Some(AgentStatus::Done),
             },
         ]
     } else {
         vec![Subscription::PaneAgentStatusChanged {
-            pane_id: pane_id.to_owned(),
+            pane_id: Some(pane_id.to_owned()),
             agent_status: Some(agent_status),
         }]
     };

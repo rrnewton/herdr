@@ -5,8 +5,8 @@ use serde::{de, Deserialize, Deserializer, Serialize};
 
 use super::{
     ActionKeybinds, BindingConfig, CommandKeybindConfig, IndexedKeybind, Keybinds, SidebarConfig,
-    SoundConfig, ThemeConfig, DEFAULT_MOBILE_WIDTH_THRESHOLD, DEFAULT_MOUSE_SCROLL_LINES,
-    DEFAULT_SCROLLBACK_LIMIT_BYTES,
+    SoundConfig, ThemeConfig, DEFAULT_MIRROR_LOCAL_SCROLLBACK_BYTES, DEFAULT_MOBILE_WIDTH_THRESHOLD,
+    DEFAULT_MOUSE_SCROLL_LINES, DEFAULT_SCROLLBACK_LIMIT_BYTES,
 };
 
 pub const MAX_TOAST_DELAY_SECONDS: u64 = 3600;
@@ -298,6 +298,7 @@ pub struct Config {
     pub advanced: AdvancedConfig,
     pub experimental: ExperimentalConfig,
     pub remote: RemoteConfig,
+    pub mirror: MirrorConfig,
 }
 
 #[derive(Debug)]
@@ -854,6 +855,25 @@ pub struct AdvancedConfig {
     /// Maximum scrollback buffer size in bytes retained per pane terminal. Default: 10000000.
     #[serde(alias = "scrollback_lines")]
     pub scrollback_limit_bytes: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct MirrorConfig {
+    /// Per-pane local scrollback budget, in bytes, for a mirror session
+    /// (`herdr --mirror`). Each mirrored pane keeps its own local emulator with
+    /// this much scrollback so history, search, and selection are instant; the
+    /// cost is client memory (roughly `panes × local_scrollback_bytes`).
+    /// Default: 8388608 (8 MiB).
+    pub local_scrollback_bytes: usize,
+}
+
+impl Default for MirrorConfig {
+    fn default() -> Self {
+        Self {
+            local_scrollback_bytes: DEFAULT_MIRROR_LOCAL_SCROLLBACK_BYTES,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1643,6 +1663,25 @@ delay_seconds = {}
             config.advanced.scrollback_limit_bytes,
             DEFAULT_SCROLLBACK_LIMIT_BYTES
         );
+    }
+
+    #[test]
+    fn mirror_defaults_to_eight_mib_local_scrollback() {
+        let config = Config::default();
+        assert_eq!(
+            config.mirror.local_scrollback_bytes,
+            DEFAULT_MIRROR_LOCAL_SCROLLBACK_BYTES
+        );
+    }
+
+    #[test]
+    fn mirror_local_scrollback_bytes_parses() {
+        let toml = r#"
+[mirror]
+local_scrollback_bytes = 2097152
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.mirror.local_scrollback_bytes, 2_097_152);
     }
 
     #[test]

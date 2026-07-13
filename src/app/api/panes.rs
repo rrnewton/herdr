@@ -1977,6 +1977,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn api_pane_get_exposes_runtime_cols_and_rows() {
+        // `pane.get` exposes the pane's live terminal size so any client (mirror,
+        // web, mobile) can render/verify pane geometry over the JSON API without
+        // the private TUI socket.
+        let (mut app, public_pane_id, _pane_id) = app_with_scrollback_runtime();
+
+        let response = app.handle_pane_get(
+            "req".into(),
+            PaneTarget {
+                pane_id: public_pane_id,
+            },
+        );
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::PaneInfo { pane } = success.result else {
+            panic!("expected pane info response");
+        };
+        // `app_with_scrollback_runtime` builds a 20x5 runtime.
+        assert_eq!(pane.cols, Some(20));
+        assert_eq!(pane.rows, Some(5));
+    }
+
+    #[tokio::test]
     async fn api_pane_get_exposes_scroll_metrics() {
         let (mut app, public_pane_id, pane_id) = app_with_scrollback_runtime();
         let runtime = app

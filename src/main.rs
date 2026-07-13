@@ -649,6 +649,7 @@ fn main() -> io::Result<()> {
     // Reject unknown flags
     let known_flags = [
         "--no-session",
+        "--mirror",
         "--session",
         "--remote",
         "--remote-keybindings",
@@ -703,6 +704,22 @@ fn main() -> io::Result<()> {
     exit_if_nested_disabled(&loaded_config.config);
 
     let no_session = args.iter().any(|a| a == "--no-session");
+
+    // Full mirror TUI: a client-rendered view of the running session that is
+    // latency-immune for scrollback/search/navigation (design-mirror-tui.md §2.5).
+    // Selected with `--mirror` or `HERDR_MIRROR=1`; not compatible with
+    // --no-session (there is no server to mirror).
+    let mirror_requested = args.iter().any(|a| a == "--mirror")
+        || std::env::var("HERDR_MIRROR").is_ok_and(|v| v == "1");
+    if mirror_requested && !no_session {
+        let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
+        let session = session::active_name();
+        if let Err(err) = client::run_mirror_session(session, cols, rows) {
+            eprintln!("herdr --mirror: {err}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
 
     // Auto-detect launch: when --no-session is NOT set, use server/client mode.
     // Check if a server is running, spawn one if needed, then attach as client.

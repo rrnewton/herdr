@@ -57,6 +57,12 @@ use tracing::info;
 use crate::config::Config;
 use crate::events::AppEvent;
 
+#[cfg(unix)]
+pub(crate) use input::{
+    prefix_indexed_navigation_action, prefix_non_indexed_navigation_action,
+    terminal_direct_indexed_navigation_action, terminal_direct_non_indexed_navigation_action,
+    NavigateAction,
+};
 pub use state::{AppState, Mode, ToastKind, ViewState};
 
 pub(crate) fn load_plugin_manifest(

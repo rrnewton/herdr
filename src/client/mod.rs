@@ -13,9 +13,30 @@
 //! - Displays sound/toast notifications forwarded from server
 
 mod input;
+mod io_pump;
+// The client-rendered mirror session is Unix-only for now, matching the rest of
+// the interactive mirror path (`design-mirror-tui.md` §7).
+#[cfg(unix)]
+mod mirror_session;
+#[cfg(unix)]
+mod scroll;
+
+/// Entry point for the full multi-pane mirror TUI (`herdr --mirror`). Unix-only
+/// for now, matching the rest of the interactive mirror path.
+#[cfg(unix)]
+pub use mirror_session::run_mirror_session;
+
+/// Non-Unix fallback: the client-rendered mirror session shares the Unix-only
+/// raw-input path, so it is unavailable elsewhere.
+#[cfg(not(unix))]
+pub fn run_mirror_session(_session: Option<String>, _cols: u16, _rows: u16) -> io::Result<()> {
+    eprintln!("herdr --mirror is not supported on this platform yet");
+    Ok(())
+}
 
 use std::collections::HashSet;
 use std::io::{self, BufRead, Write as _};
+use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -44,6 +65,7 @@ use crate::protocol::{
     MAX_GRAPHICS_FRAME_SIZE, PROTOCOL_VERSION,
 };
 use crate::server::socket_paths::client_socket_path;
+use io_pump::{ClientEventPump, ClientLoopHandler, LoopEnd};
 
 static RECEIVED_KITTY_GRAPHICS_IDS: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
 
@@ -348,6 +370,30 @@ fn setup_terminal_with_capabilities(
     mouse_capture: bool,
 ) -> io::Result<TerminalGuard> {
     ratatui::init();
+    apply_client_terminal_capabilities(enable_client_protocols, mouse_capture)
+}
+
+/// Sets up a ratatui terminal for the full mirror TUI and returns it alongside
+/// the restore guard. Unlike [`setup_terminal_with_capabilities`] (which discards
+/// the terminal because the single-pane attach/mirror paths blit to stdout
+/// directly), the multi-pane mirror renders through `terminal.draw`, so it needs
+/// the `DefaultTerminal` (`design-mirror-tui.md` §3.2).
+#[cfg(unix)]
+pub(crate) fn setup_mirror_terminal(
+    mouse_capture: bool,
+) -> io::Result<(ratatui::DefaultTerminal, TerminalGuard)> {
+    let terminal = ratatui::init();
+    let guard = apply_client_terminal_capabilities(true, mouse_capture)?;
+    Ok((terminal, guard))
+}
+
+/// Applies client input/mouse/paste/keyboard capabilities on the already-init'd
+/// terminal and returns the guard that restores them on drop. Shared by the
+/// attach/mirror setups so their capability handling can't drift.
+fn apply_client_terminal_capabilities(
+    enable_client_protocols: bool,
+    mouse_capture: bool,
+) -> io::Result<TerminalGuard> {
     crate::terminal_modes::clear_host_mouse_reporting(&mut io::stdout())?;
     let host_color_scheme_reports =
         should_enable_host_color_scheme_reports(enable_client_protocols);
@@ -417,7 +463,7 @@ fn should_enable_host_color_scheme_reports(enable_client_protocols: bool) -> boo
 }
 
 /// Guard that restores the terminal when dropped.
-struct TerminalGuard {
+pub(crate) struct TerminalGuard {
     reset_modify_other_keys: bool,
     reset_host_color_scheme_reports: bool,
     #[cfg(windows)]
@@ -808,6 +854,46 @@ enum ClientLoopEvent {
     ServerMessage(ServerMessage),
     /// Server reader thread exited (connection lost).
     ServerDisconnected,
+    /// A mirror data-plane message tagged with the terminal it belongs to.
+    ///
+    /// The full mirror session opens one wire connection per terminal, so its
+    /// server readers tag each message with a `terminal_id` and the session
+    /// routes it to that terminal's local emulator (`design-mirror-tui.md` §2.1,
+    /// Phase 3). Unlike [`Self::ServerMessage`], which carries no terminal
+    /// identity, this variant lets multiple per-terminal readers share one pump.
+    ///
+    /// Produced by [`mirror_server_reader_thread`]; the fields are read by the
+    /// mirror app driver's handler (Phase 4), which routes them through
+    /// [`mirror_session::MirrorConnectionManager::apply`], so they read as unused
+    /// until that lands.
+    #[cfg(unix)]
+    #[allow(dead_code)]
+    ServerMirror {
+        terminal_id: String,
+        msg: ServerMessage,
+    },
+    /// A per-terminal mirror reader exited (its data connection dropped).
+    ///
+    /// The mirror app driver's handler (Phase 4) reads `terminal_id` to reconnect
+    /// that terminal via [`mirror_session::MirrorConnectionManager::reconnect`];
+    /// unused until then.
+    #[cfg(unix)]
+    #[allow(dead_code)]
+    ServerMirrorDisconnected { terminal_id: String },
+    /// A structural event from the JSON API control plane (`events.subscribe`).
+    ///
+    /// The full mirror session subscribes to workspace/tab/pane/layout/focus
+    /// events to keep its replica current (`design-mirror-tui.md` §2.4); a reader
+    /// thread feeds each one here so the app loop reconciles it alongside stdin,
+    /// resize, and per-terminal mirror data. Consumed by the mirror app driver.
+    #[cfg(unix)]
+    #[allow(dead_code)]
+    ControlEvent(Box<crate::api::schema::EventEnvelope>),
+    /// The mirror control-plane event stream ended or failed; the full mirror
+    /// session should rebuild its replica from a fresh snapshot and resubscribe.
+    #[cfg(unix)]
+    #[allow(dead_code)]
+    ControlDisconnected,
     /// Timer tick.
     Timer,
 }
@@ -956,6 +1042,49 @@ fn connect_mirror_stream(
     Ok(stream)
 }
 
+/// Connects, handshakes, and subscribes one terminal's mirror data connection on
+/// an explicit wire socket, returning the ready stream.
+///
+/// Unlike [`connect_mirror_stream`] (which derives the socket from the active
+/// session), the full mirror session's connection manager passes the socket it
+/// resolved for the target session and opens one of these per terminal
+/// (`design-mirror-tui.md` §2.1, Phase 3). Errors are typed as [`ClientError`] so
+/// the manager can distinguish connect vs. subscribe failures.
+#[cfg(unix)]
+pub(crate) fn connect_mirror_data_stream(
+    socket_path: &std::path::Path,
+    target: &str,
+    cols: u16,
+    rows: u16,
+    resume_from: Option<u64>,
+    writable: bool,
+) -> Result<LocalStream, ClientError> {
+    let mut stream =
+        crate::ipc::connect_local_stream(socket_path).map_err(ClientError::ConnectionFailed)?;
+    do_handshake(
+        &mut stream,
+        cols,
+        rows,
+        0,
+        0,
+        RenderEncoding::TerminalAnsi,
+        true,
+    )?;
+    stream
+        .set_nonblocking(false)
+        .map_err(ClientError::ConnectionFailed)?;
+    write_to_server(
+        &mut stream,
+        &ClientMessage::MirrorTerminal {
+            target: target.to_owned(),
+            resume_from,
+            writable,
+        },
+    )
+    .map_err(ClientError::ConnectionLost)?;
+    Ok(stream)
+}
+
 /// Interactive mirror is Unix-only for now (it shares the direct-attach raw input
 /// path). Non-Unix falls back to the JSON stream.
 #[cfg(not(unix))]
@@ -971,6 +1100,7 @@ pub fn run_terminal_session_mirror(
 /// Outcome of one connected mirror session, deciding what the reconnect loop
 /// does next.
 #[cfg(unix)]
+#[derive(Clone, Copy)]
 enum MirrorSessionEnd {
     /// The user detached or the terminal ended; stop.
     Done,
@@ -997,20 +1127,12 @@ async fn run_terminal_mirror_loop(
     let mut viewport_rows = rows;
     let mut client_size = (cols, rows);
 
-    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<ClientLoopEvent>(256);
-
-    // stdin and resize threads live for the whole session, across reconnects.
-    let stdin_quit = should_quit.clone();
-    let stdin_tx = event_tx.clone();
+    // The pump (event channel) and its stdin/resize threads live for the whole
+    // session, across reconnects. Each connection adds its own server reader.
+    let mut pump = ClientEventPump::new(should_quit.clone());
     let mouse_active = Arc::new(AtomicBool::new(true));
-    std::thread::spawn(move || {
-        input::stdin_reader_loop(stdin_tx, &stdin_quit, false, mouse_active);
-    });
-    let resize_quit = should_quit.clone();
-    let resize_tx = event_tx.clone();
-    std::thread::spawn(move || {
-        resize_poll_loop(resize_tx, cols, rows, false, &resize_quit);
-    });
+    pump.spawn_stdin(false, mouse_active);
+    pump.spawn_resize(cols, rows, false);
 
     let mut stream = Some(first_stream);
     let mut backoff = Duration::from_millis(200);
@@ -1043,8 +1165,7 @@ async fn run_terminal_mirror_loop(
             connected,
             &mut mirror,
             &mut escape,
-            &mut event_rx,
-            &should_quit,
+            &mut pump,
             mouse_scroll_lines,
             &mut viewport_rows,
             &mut client_size,
@@ -1059,27 +1180,25 @@ async fn run_terminal_mirror_loop(
 }
 
 /// Runs one connected mirror session until the link drops or the user leaves.
+///
+/// Owns the connection's writer and server reader; local input/resize/timer and
+/// server messages all arrive through the shared [`ClientEventPump`]. Per-event
+/// behavior lives in [`MirrorHandler`].
 #[cfg(unix)]
-#[allow(clippy::too_many_arguments)]
 async fn run_connected_mirror_session(
     stream: LocalStream,
     mirror: &mut crate::pane::LocalMirror,
     escape: &mut AttachEscapeState,
-    event_rx: &mut tokio::sync::mpsc::Receiver<ClientLoopEvent>,
-    should_quit: &Arc<AtomicBool>,
+    pump: &mut ClientEventPump,
     mouse_scroll_lines: usize,
     viewport_rows: &mut u16,
     client_size: &mut (u16, u16),
 ) -> Result<MirrorSessionEnd, ClientError> {
     let mut blit = render_ansi::BlitEncoder::new();
 
-    // Per-connection server reader thread.
-    let server_quit = should_quit.clone();
-    let (server_tx, mut merged_rx) = tokio::sync::mpsc::channel::<ClientLoopEvent>(256);
+    // Per-connection server reader feeds the shared pump channel.
     let read_stream = stream.try_clone().map_err(ClientError::ConnectionFailed)?;
-    let reader = std::thread::spawn(move || {
-        server_reader_thread(read_stream, server_tx, &server_quit, MAX_FRAME_SIZE);
-    });
+    let reader = pump.spawn_server_reader(read_stream, MAX_FRAME_SIZE);
 
     let mut write_stream = stream;
     write_stream
@@ -1098,143 +1217,29 @@ async fn run_connected_mirror_session(
     );
     repaint_mirror(mirror, &mut blit, true)?;
 
-    let end = loop {
-        if should_quit.load(Ordering::Acquire) {
-            break MirrorSessionEnd::Done;
-        }
-        // Local input/resize events arrive on event_rx; server messages on
-        // merged_rx. Whichever is ready drives the loop.
-        let event = tokio::select! {
-            ev = event_rx.recv() => ev.unwrap_or(ClientLoopEvent::Timer),
-            ev = merged_rx.recv() => ev.unwrap_or(ClientLoopEvent::ServerDisconnected),
-            _ = tokio::time::sleep(Duration::from_millis(100)) => ClientLoopEvent::Timer,
-        };
-
-        match event {
-            #[cfg(unix)]
-            ClientLoopEvent::StdinInput(data) => {
-                match escape.filter_input(data, *viewport_rows, mouse_scroll_lines) {
-                    AttachInputAction::Forward(bytes) => {
-                        if mirror.is_scrolled_back() {
-                            mirror.scroll_to_bottom();
-                            repaint_mirror(mirror, &mut blit, false)?;
-                        }
-                        let _ = write_to_server(
-                            &mut write_stream,
-                            &ClientMessage::Input { data: bytes },
-                        );
-                    }
-                    AttachInputAction::Scroll {
-                        source,
-                        direction,
-                        lines,
-                        ..
-                    } => {
-                        let handle_locally = match &source {
-                            AttachScrollSource::Wheel => true,
-                            AttachScrollSource::PageKey { .. } => !mirror.is_alt_screen(),
-                        };
-                        if handle_locally {
-                            match direction {
-                                AttachScrollDirection::Up => mirror.scroll_up(lines as usize),
-                                AttachScrollDirection::Down => mirror.scroll_down(lines as usize),
-                            }
-                            repaint_mirror(mirror, &mut blit, false)?;
-                        } else if let AttachScrollSource::PageKey { input } = source {
-                            let _ = write_to_server(
-                                &mut write_stream,
-                                &ClientMessage::Input { data: input },
-                            );
-                        }
-                    }
-                    AttachInputAction::Detach => {
-                        let _ = write_to_server(&mut write_stream, &ClientMessage::Detach);
-                        break MirrorSessionEnd::Done;
-                    }
-                    AttachInputAction::None => {}
-                }
-            }
-            #[cfg(windows)]
-            ClientLoopEvent::StdinEvents(_) => {}
-            ClientLoopEvent::Resize(new_cols, new_rows, cell_width_px, cell_height_px) => {
-                *viewport_rows = new_rows;
-                *client_size = (new_cols, new_rows);
-                let _ = write_to_server(
-                    &mut write_stream,
-                    &ClientMessage::Resize {
-                        cols: new_cols,
-                        rows: new_rows,
-                        cell_width_px,
-                        cell_height_px,
-                    },
-                );
-                blit = render_ansi::BlitEncoder::new();
-            }
-            ClientLoopEvent::ServerMessage(ServerMessage::MirrorSnapshot {
-                base_seq,
-                cols: src_cols,
-                rows: src_rows,
-            }) => {
-                let outcome = mirror
-                    .apply_snapshot(base_seq, src_cols, src_rows)
-                    .map_err(ClientError::ConnectionFailed)?;
-                repaint_mirror(mirror, &mut blit, outcome.needs_full_redraw)?;
-            }
-            ClientLoopEvent::ServerMessage(ServerMessage::MirrorEvent { seq, kind }) => {
-                let mut outcome = mirror.apply_event(seq, kind);
-                // Coalesce a burst of pending events (e.g. the initial history
-                // replay) into a single repaint to avoid flicker and wasted work.
-                while !outcome.closed {
-                    match merged_rx.try_recv() {
-                        Ok(ClientLoopEvent::ServerMessage(ServerMessage::MirrorEvent {
-                            seq,
-                            kind,
-                        })) => {
-                            let next = mirror.apply_event(seq, kind);
-                            outcome.needs_full_redraw |= next.needs_full_redraw;
-                            outcome.closed |= next.closed;
-                        }
-                        Ok(ClientLoopEvent::ServerMessage(ServerMessage::MirrorSnapshot {
-                            base_seq,
-                            cols: src_cols,
-                            rows: src_rows,
-                        })) => {
-                            let next = mirror
-                                .apply_snapshot(base_seq, src_cols, src_rows)
-                                .map_err(ClientError::ConnectionFailed)?;
-                            outcome.needs_full_redraw |= next.needs_full_redraw;
-                        }
-                        Ok(ClientLoopEvent::ServerMessage(ServerMessage::ServerShutdown {
-                            ..
-                        })) => {
-                            outcome.closed = true;
-                        }
-                        // Anything else (or an empty/closed queue): stop draining
-                        // and let the next loop iteration handle it.
-                        _ => break,
-                    }
-                }
-                if outcome.closed {
-                    break MirrorSessionEnd::Done;
-                }
-                if outcome.needs_full_redraw || !mirror.is_scrolled_back() {
-                    repaint_mirror(mirror, &mut blit, outcome.needs_full_redraw)?;
-                }
-            }
-            ClientLoopEvent::ServerMessage(ServerMessage::ServerShutdown { .. }) => {
-                break MirrorSessionEnd::Done;
-            }
-            ClientLoopEvent::ServerMessage(_) => {}
-            ClientLoopEvent::ServerDisconnected => break MirrorSessionEnd::Reconnect,
-            ClientLoopEvent::Timer => {}
-        }
+    let mut handler = MirrorHandler {
+        mirror,
+        escape,
+        blit,
+        write_stream,
+        mouse_scroll_lines,
+        viewport_rows,
+        client_size,
+        end: MirrorSessionEnd::Done,
+    };
+    let end = match pump.run(&mut handler).await {
+        Ok(LoopEnd::Quit) => MirrorSessionEnd::Done,
+        Ok(LoopEnd::Handler) => handler.end,
+        // On error, abandon both writer and reader (they die with the process),
+        // matching the pre-refactor early-return behavior.
+        Err(err) => return Err(err),
     };
 
     // Tear down this connection's writer. On reconnect the reader has already
     // exited (it emitted ServerDisconnected), so join it; on a clean exit the
     // reader may still be blocked on a read, so abandon it — it dies with the
     // process when the command returns.
-    drop(write_stream);
+    drop(handler);
     match end {
         MirrorSessionEnd::Reconnect => {
             let _ = reader.join();
@@ -1244,6 +1249,169 @@ async fn run_connected_mirror_session(
     Ok(end)
 }
 
+/// Per-connection mirror event handling driven by [`ClientEventPump::run`].
+#[cfg(unix)]
+struct MirrorHandler<'a> {
+    mirror: &'a mut crate::pane::LocalMirror,
+    escape: &'a mut AttachEscapeState,
+    blit: render_ansi::BlitEncoder,
+    write_stream: LocalStream,
+    mouse_scroll_lines: usize,
+    viewport_rows: &'a mut u16,
+    client_size: &'a mut (u16, u16),
+    /// How the session ended once the handler breaks the loop.
+    end: MirrorSessionEnd,
+}
+
+#[cfg(unix)]
+impl ClientLoopHandler for MirrorHandler<'_> {
+    fn on_event(
+        &mut self,
+        event: ClientLoopEvent,
+        pump: &mut ClientEventPump,
+    ) -> Result<ControlFlow<()>, ClientError> {
+        match event {
+            ClientLoopEvent::StdinInput(data) => {
+                match self
+                    .escape
+                    .filter_input(data, *self.viewport_rows, self.mouse_scroll_lines)
+                {
+                    AttachInputAction::Forward(bytes) => {
+                        if self.mirror.is_scrolled_back() {
+                            self.mirror.scroll_to_bottom();
+                            repaint_mirror(self.mirror, &mut self.blit, false)?;
+                        }
+                        let _ = write_to_server(
+                            &mut self.write_stream,
+                            &ClientMessage::Input { data: bytes },
+                        );
+                    }
+                    AttachInputAction::Scroll {
+                        source,
+                        direction,
+                        lines,
+                        ..
+                    } => {
+                        let handle_locally = matches!(
+                            scroll::scroll_disposition(&source, self.mirror.input_state()),
+                            scroll::ScrollDisposition::Local
+                        );
+                        if handle_locally {
+                            match direction {
+                                AttachScrollDirection::Up => self.mirror.scroll_up(lines as usize),
+                                AttachScrollDirection::Down => {
+                                    self.mirror.scroll_down(lines as usize)
+                                }
+                            }
+                            repaint_mirror(self.mirror, &mut self.blit, false)?;
+                        } else if let AttachScrollSource::PageKey { input } = source {
+                            let _ = write_to_server(
+                                &mut self.write_stream,
+                                &ClientMessage::Input { data: input },
+                            );
+                        }
+                    }
+                    AttachInputAction::Detach => {
+                        let _ = write_to_server(&mut self.write_stream, &ClientMessage::Detach);
+                        self.end = MirrorSessionEnd::Done;
+                        return Ok(ControlFlow::Break(()));
+                    }
+                    AttachInputAction::None => {}
+                }
+            }
+            ClientLoopEvent::Resize(new_cols, new_rows, cell_width_px, cell_height_px) => {
+                *self.viewport_rows = new_rows;
+                *self.client_size = (new_cols, new_rows);
+                let _ = write_to_server(
+                    &mut self.write_stream,
+                    &ClientMessage::Resize {
+                        cols: new_cols,
+                        rows: new_rows,
+                        cell_width_px,
+                        cell_height_px,
+                    },
+                );
+                self.blit = render_ansi::BlitEncoder::new();
+            }
+            ClientLoopEvent::ServerMessage(ServerMessage::MirrorSnapshot {
+                base_seq,
+                cols: src_cols,
+                rows: src_rows,
+            }) => {
+                let outcome = self
+                    .mirror
+                    .apply_snapshot(base_seq, src_cols, src_rows)
+                    .map_err(ClientError::ConnectionFailed)?;
+                repaint_mirror(self.mirror, &mut self.blit, outcome.needs_full_redraw)?;
+            }
+            ClientLoopEvent::ServerMessage(ServerMessage::MirrorEvent { seq, kind }) => {
+                let mut outcome = self.mirror.apply_event(seq, kind);
+                // Coalesce a burst of pending events (e.g. the initial history
+                // replay) into a single repaint to avoid flicker and wasted work.
+                while !outcome.closed {
+                    match pump.try_next() {
+                        Some(ClientLoopEvent::ServerMessage(ServerMessage::MirrorEvent {
+                            seq,
+                            kind,
+                        })) => {
+                            let next = self.mirror.apply_event(seq, kind);
+                            outcome.needs_full_redraw |= next.needs_full_redraw;
+                            outcome.closed |= next.closed;
+                        }
+                        Some(ClientLoopEvent::ServerMessage(ServerMessage::MirrorSnapshot {
+                            base_seq,
+                            cols: src_cols,
+                            rows: src_rows,
+                        })) => {
+                            let next = self
+                                .mirror
+                                .apply_snapshot(base_seq, src_cols, src_rows)
+                                .map_err(ClientError::ConnectionFailed)?;
+                            outcome.needs_full_redraw |= next.needs_full_redraw;
+                        }
+                        Some(ClientLoopEvent::ServerMessage(ServerMessage::ServerShutdown {
+                            ..
+                        })) => {
+                            outcome.closed = true;
+                        }
+                        // Not part of this burst (input/resize/disconnect): put it
+                        // back so the next loop iteration handles it in order.
+                        Some(other) => {
+                            pump.push_front(other);
+                            break;
+                        }
+                        None => break,
+                    }
+                }
+                if outcome.closed {
+                    self.end = MirrorSessionEnd::Done;
+                    return Ok(ControlFlow::Break(()));
+                }
+                if outcome.needs_full_redraw || !self.mirror.is_scrolled_back() {
+                    repaint_mirror(self.mirror, &mut self.blit, outcome.needs_full_redraw)?;
+                }
+            }
+            ClientLoopEvent::ServerMessage(ServerMessage::ServerShutdown { .. }) => {
+                self.end = MirrorSessionEnd::Done;
+                return Ok(ControlFlow::Break(()));
+            }
+            ClientLoopEvent::ServerMessage(_) => {}
+            ClientLoopEvent::ServerDisconnected => {
+                self.end = MirrorSessionEnd::Reconnect;
+                return Ok(ControlFlow::Break(()));
+            }
+            // Tagged per-terminal mirror events belong to the full multi-pane
+            // mirror session, not this single-connection interactive mirror.
+            ClientLoopEvent::ServerMirror { .. }
+            | ClientLoopEvent::ServerMirrorDisconnected { .. }
+            | ClientLoopEvent::ControlEvent(_)
+            | ClientLoopEvent::ControlDisconnected => {}
+            ClientLoopEvent::Timer => {}
+        }
+        Ok(ControlFlow::Continue(()))
+    }
+}
+
 /// Renders the mirror's current viewport and writes the diff to stdout.
 #[cfg(unix)]
 fn repaint_mirror(
@@ -1251,18 +1419,18 @@ fn repaint_mirror(
     blit: &mut render_ansi::BlitEncoder,
     full_redraw: bool,
 ) -> Result<(), ClientError> {
-    if full_redraw {
-        *blit = render_ansi::BlitEncoder::new();
-    }
     let frame = mirror.render_frame();
-    let encoded = blit.encode(&frame, false);
-    let mut stdout = io::stdout();
-    stdout
-        .write_all(&encoded.bytes)
-        .map_err(ClientError::ConnectionLost)?;
-    stdout.flush().map_err(ClientError::ConnectionLost)?;
-    blit.commit(frame, encoded);
-    Ok(())
+    write_frame_to_stdout(
+        &mut io::stdout(),
+        blit,
+        frame,
+        FrameWriteOptions {
+            full_redraw,
+            draw_host_cursor: false,
+            graphics_enabled: false,
+        },
+    )
+    .map_err(ClientError::ConnectionLost)
 }
 
 /// Runs a writable terminal session controller.
@@ -1758,7 +1926,7 @@ async fn run_client_loop(
     #[cfg(unix)]
     let is_remote_client = is_remote_client_process();
 
-    let mut state = ClientState {
+    let state = ClientState {
         blit_encoder: render_ansi::BlitEncoder::new(),
         mouse_capture_active: config.mouse_capture_active,
         reported_size: (cols, rows),
@@ -1775,81 +1943,93 @@ async fn run_client_loop(
     debug!(?negotiated_encoding, "client render encoding active");
     let host_mouse_capture_active = Arc::new(AtomicBool::new(state.mouse_capture_active));
 
-    // Channel for events from the stdin, resize, and server reader threads.
-    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<ClientLoopEvent>(256);
+    // The pump owns the event channel and its stdin/resize/server-reader threads.
+    let mut pump = ClientEventPump::new(should_quit.clone());
 
     // Spawn the stdin reader thread.
     let will_query_host_terminal_theme =
         state.attach_escape.is_none() && should_query_host_terminal_theme();
-    let stdin_quit = should_quit.clone();
-    let stdin_tx = event_tx.clone();
-    let stdin_mouse_capture_active = host_mouse_capture_active.clone();
-    std::thread::spawn(move || {
-        input::stdin_reader_loop(
-            stdin_tx,
-            &stdin_quit,
-            will_query_host_terminal_theme,
-            stdin_mouse_capture_active,
-        );
-    });
+    pump.spawn_stdin(
+        will_query_host_terminal_theme,
+        host_mouse_capture_active.clone(),
+    );
 
     if will_query_host_terminal_theme {
         query_host_terminal_theme();
     }
 
     // Spawn the resize poller thread.
-    let resize_quit = should_quit.clone();
-    let resize_tx = event_tx.clone();
     let kitty_graphics_enabled = state.kitty_graphics_enabled;
-    std::thread::spawn(move || {
-        resize_poll_loop(resize_tx, cols, rows, kitty_graphics_enabled, &resize_quit);
-    });
+    pump.spawn_resize(cols, rows, kitty_graphics_enabled);
 
     // Spawn the server reader thread (blocking reads from the socket).
     // Clone the stream's file descriptor so we can read from a blocking stream.
-    let server_read_quit = should_quit.clone();
-    let server_read_tx = event_tx.clone();
     let read_stream = stream.try_clone().map_err(ClientError::ConnectionFailed)?;
-    std::thread::spawn(move || {
-        let max_frame_size = if kitty_graphics_enabled {
-            MAX_GRAPHICS_FRAME_SIZE
-        } else {
-            MAX_FRAME_SIZE
-        };
-        server_reader_thread(
-            read_stream,
-            server_read_tx,
-            &server_read_quit,
-            max_frame_size,
-        );
-    });
+    let max_frame_size = if kitty_graphics_enabled {
+        MAX_GRAPHICS_FRAME_SIZE
+    } else {
+        MAX_FRAME_SIZE
+    };
+    pump.spawn_server_reader(read_stream, max_frame_size);
 
     // Use the original stream for writing (blocking is fine since we write
     // from the async loop).
-    let mut write_stream = stream;
+    let write_stream = stream;
     write_stream
         .set_nonblocking(false)
         .map_err(ClientError::ConnectionFailed)?;
 
     // This (foreground) client owns the prefix ASCII input-source switch; a no-op on non-macOS.
-    use crate::platform::PrefixInputSource;
-    let mut prefix_input_source = crate::platform::RealPrefixInputSource::default();
+    let prefix_input_source = crate::platform::RealPrefixInputSource::default();
 
-    // Main event loop.
-    while !should_quit.load(Ordering::Acquire) {
-        let event = tokio::select! {
-            ev = event_rx.recv() => ev.unwrap_or(ClientLoopEvent::Timer),
-            _ = tokio::time::sleep(Duration::from_millis(100)) => ClientLoopEvent::Timer,
-        };
+    let mut handler = RoundTripHandler {
+        state,
+        write_stream,
+        host_mouse_capture_active,
+        prefix_input_source,
+        #[cfg(unix)]
+        is_remote_client,
+    };
 
+    // The single shared event loop drives the handler.
+    match pump.run(&mut handler).await? {
+        LoopEnd::Quit => {
+            // Clean exit (Ctrl+C). Send Detach before closing.
+            let _ = write_to_server(&mut handler.write_stream, &ClientMessage::Detach);
+            let _ = io::stdout().flush();
+        }
+        LoopEnd::Handler => {}
+    }
+
+    Ok(())
+}
+
+/// Round-trip (server-rendered) client event handling driven by
+/// [`ClientEventPump::run`].
+struct RoundTripHandler {
+    state: ClientState,
+    write_stream: LocalStream,
+    host_mouse_capture_active: Arc<AtomicBool>,
+    prefix_input_source: crate::platform::RealPrefixInputSource,
+    #[cfg(unix)]
+    is_remote_client: bool,
+}
+
+impl ClientLoopHandler for RoundTripHandler {
+    fn on_event(
+        &mut self,
+        event: ClientLoopEvent,
+        _pump: &mut ClientEventPump,
+    ) -> Result<ControlFlow<()>, ClientError> {
+        use crate::platform::PrefixInputSource;
         match event {
             #[cfg(unix)]
             ClientLoopEvent::StdinInput(data) => {
-                let data = if let Some(attach_escape) = &mut state.attach_escape {
+                let data = if let Some(attach_escape) = &mut self.state.attach_escape {
                     match attach_escape.filter_input(
                         data,
-                        state.reported_size.1,
-                        state.mouse_scroll_lines,
+                        self.state.reported_size.1,
+                        self.state.mouse_scroll_lines,
                     ) {
                         AttachInputAction::Forward(data) => data,
                         AttachInputAction::Scroll {
@@ -1868,24 +2048,24 @@ async fn run_client_loop(
                                 row,
                                 modifiers,
                             };
-                            if let Err(e) = write_to_server(&mut write_stream, &msg) {
+                            if let Err(e) = write_to_server(&mut self.write_stream, &msg) {
                                 return Err(ClientError::ConnectionLost(e));
                             }
-                            continue;
+                            return Ok(ControlFlow::Continue(()));
                         }
                         AttachInputAction::Detach => {
-                            let _ = write_to_server(&mut write_stream, &ClientMessage::Detach);
-                            return Ok(());
+                            let _ = write_to_server(&mut self.write_stream, &ClientMessage::Detach);
+                            return Ok(ControlFlow::Break(()));
                         }
-                        AttachInputAction::None => continue,
+                        AttachInputAction::None => return Ok(ControlFlow::Continue(())),
                     }
                 } else {
                     let events = crate::raw_input::parse_raw_input_bytes_sync(&data);
                     if crate::raw_input::events_require_host_surface_redraw(
                         &events,
-                        state.redraw_on_focus_gained,
+                        self.state.redraw_on_focus_gained,
                     ) {
-                        state.request_full_redraw();
+                        self.state.request_full_redraw();
                     }
                     if crate::raw_input::events_require_host_terminal_theme_query(&events) {
                         query_host_terminal_theme();
@@ -1894,8 +2074,8 @@ async fn run_client_loop(
                 };
                 if should_bridge_clipboard_image_paste(
                     &data,
-                    is_remote_client,
-                    state.remote_image_paste_key,
+                    self.is_remote_client,
+                    self.state.remote_image_paste_key,
                 ) {
                     if let Some(image) = crate::platform::read_clipboard_image() {
                         if image.bytes.len() > MAX_CLIPBOARD_IMAGE_PAYLOAD {
@@ -1904,7 +2084,7 @@ async fn run_client_loop(
                                 max = MAX_CLIPBOARD_IMAGE_PAYLOAD,
                                 "local clipboard image is too large to bridge"
                             );
-                            continue;
+                            return Ok(ControlFlow::Continue(()));
                         }
                         info!(
                             bytes = image.bytes.len(),
@@ -1915,16 +2095,18 @@ async fn run_client_loop(
                             extension: image.extension.to_owned(),
                             data: image.bytes,
                         };
-                        if let Err(e) = write_to_server(&mut write_stream, &msg) {
+                        if let Err(e) = write_to_server(&mut self.write_stream, &msg) {
                             return Err(ClientError::ConnectionLost(e));
                         }
-                        continue;
+                        return Ok(ControlFlow::Continue(()));
                     }
                     info!(
                         "clipboard image paste trigger received, but local clipboard has no image"
                     );
                 }
-                if let Some(image) = read_image_file_from_terminal_drop(&data, is_remote_client) {
+                if let Some(image) =
+                    read_image_file_from_terminal_drop(&data, self.is_remote_client)
+                {
                     info!(
                         bytes = image.bytes.len(),
                         extension = image.extension,
@@ -1934,20 +2116,20 @@ async fn run_client_loop(
                         extension: image.extension.to_owned(),
                         data: image.bytes,
                     };
-                    if let Err(e) = write_to_server(&mut write_stream, &msg) {
+                    if let Err(e) = write_to_server(&mut self.write_stream, &msg) {
                         return Err(ClientError::ConnectionLost(e));
                     }
-                    continue;
+                    return Ok(ControlFlow::Continue(()));
                 }
                 let msg = ClientMessage::Input { data };
-                if let Err(e) = write_to_server(&mut write_stream, &msg) {
+                if let Err(e) = write_to_server(&mut self.write_stream, &msg) {
                     return Err(ClientError::ConnectionLost(e));
                 }
             }
             #[cfg(windows)]
             ClientLoopEvent::StdinEvents(events) => {
-                if state.attach_escape.is_some() {
-                    continue;
+                if self.state.attach_escape.is_some() {
+                    return Ok(ControlFlow::Continue(()));
                 }
                 let raw_events = events
                     .iter()
@@ -1955,54 +2137,44 @@ async fn run_client_loop(
                     .collect::<Vec<_>>();
                 if crate::raw_input::events_require_host_surface_redraw(
                     &raw_events,
-                    state.redraw_on_focus_gained,
+                    self.state.redraw_on_focus_gained,
                 ) {
-                    state.request_full_redraw();
+                    self.state.request_full_redraw();
                 }
                 let msg = ClientMessage::InputEvents { events };
-                if let Err(e) = write_to_server(&mut write_stream, &msg) {
+                if let Err(e) = write_to_server(&mut self.write_stream, &msg) {
                     return Err(ClientError::ConnectionLost(e));
                 }
             }
             ClientLoopEvent::Resize(new_cols, new_rows, cell_width_px, cell_height_px) => {
-                state.reported_size = (new_cols, new_rows);
+                self.state.reported_size = (new_cols, new_rows);
                 let msg = ClientMessage::Resize {
                     cols: new_cols,
                     rows: new_rows,
                     cell_width_px,
                     cell_height_px,
                 };
-                if let Err(e) = write_to_server(&mut write_stream, &msg) {
+                if let Err(e) = write_to_server(&mut self.write_stream, &msg) {
                     return Err(ClientError::ConnectionLost(e));
                 }
             }
             ClientLoopEvent::ServerMessage(msg) => match msg {
                 ServerMessage::Frame(frame_data) => {
-                    let frame_data = if state.draw_host_cursor {
-                        render_ansi::frame_with_drawn_cursor(frame_data)
-                    } else {
-                        frame_data
-                    };
-                    let encoded = if state.draw_host_cursor {
-                        state
-                            .blit_encoder
-                            .encode_with_suppressed_visible_cursor(&frame_data, false)
-                    } else {
-                        state.blit_encoder.encode(&frame_data, false)
-                    };
-                    let mut stdout = io::stdout();
-                    let graphics = if state.kitty_graphics_enabled {
-                        frame_data.graphics.as_slice()
-                    } else {
-                        &[]
-                    };
-                    let _ =
-                        write_encoded_frame_with_graphics(&mut stdout, &encoded.bytes, graphics);
-                    let _ = stdout.flush();
-                    state.blit_encoder.commit(frame_data, encoded);
+                    let _ = write_frame_to_stdout(
+                        &mut io::stdout(),
+                        &mut self.state.blit_encoder,
+                        frame_data,
+                        FrameWriteOptions {
+                            full_redraw: false,
+                            draw_host_cursor: self.state.draw_host_cursor,
+                            graphics_enabled: self.state.kitty_graphics_enabled,
+                        },
+                    );
                 }
                 ServerMessage::Terminal(frame) => {
-                    if state.kitty_graphics_enabled && contains_kitty_graphics_bytes(&frame.bytes) {
+                    if self.state.kitty_graphics_enabled
+                        && contains_kitty_graphics_bytes(&frame.bytes)
+                    {
                         record_received_kitty_graphics(&frame.bytes);
                     }
                     let mut stdout = io::stdout();
@@ -2010,7 +2182,7 @@ async fn run_client_loop(
                     let _ = stdout.flush();
                 }
                 ServerMessage::Graphics { bytes } => {
-                    if state.kitty_graphics_enabled {
+                    if self.state.kitty_graphics_enabled {
                         record_received_kitty_graphics(&bytes);
                         let mut stdout = io::stdout();
                         let _ = stdout.write_all(&bytes);
@@ -2025,7 +2197,7 @@ async fn run_client_loop(
                     message,
                     body,
                 } => {
-                    handle_notify(kind, &message, body.as_deref(), &state.sound_config);
+                    handle_notify(kind, &message, body.as_deref(), &self.state.sound_config);
                 }
                 ServerMessage::Clipboard { data } => {
                     forward_clipboard(&data);
@@ -2037,30 +2209,31 @@ async fn run_client_loop(
                 }
                 ServerMessage::ReloadSoundConfig => {
                     reload_local_client_config(
-                        &mut state.sound_config,
-                        &mut state.redraw_on_focus_gained,
-                        &mut state.draw_host_cursor,
+                        &mut self.state.sound_config,
+                        &mut self.state.redraw_on_focus_gained,
+                        &mut self.state.draw_host_cursor,
                         #[cfg(unix)]
-                        &mut state.remote_image_paste_key,
+                        &mut self.state.remote_image_paste_key,
                     );
                 }
                 ServerMessage::MouseCapture { enabled } => {
                     let desired = enabled;
-                    if desired != state.mouse_capture_active {
+                    if desired != self.state.mouse_capture_active {
                         set_mouse_capture(desired).map_err(ClientError::ConnectionFailed)?;
                         #[cfg(windows)]
                         if windows_vti_input_backend_enabled() {
                             let _ = enable_windows_virtual_terminal_input();
                         }
-                        state.mouse_capture_active = desired;
-                        host_mouse_capture_active.store(desired, Ordering::Release);
+                        self.state.mouse_capture_active = desired;
+                        self.host_mouse_capture_active
+                            .store(desired, Ordering::Release);
                     }
                 }
                 ServerMessage::PrefixInputSource { active } => {
                     if active {
-                        prefix_input_source.switch_to_ascii();
+                        self.prefix_input_source.switch_to_ascii();
                     } else {
-                        prefix_input_source.restore();
+                        self.prefix_input_source.restore();
                     }
                 }
                 ServerMessage::Welcome { .. } => {
@@ -2076,16 +2249,17 @@ async fn run_client_loop(
                     "server closed connection",
                 )));
             }
+            // Tagged per-terminal mirror events are only produced by the full
+            // mirror session's connection manager, never on the round-trip path.
+            #[cfg(unix)]
+            ClientLoopEvent::ServerMirror { .. }
+            | ClientLoopEvent::ServerMirrorDisconnected { .. }
+            | ClientLoopEvent::ControlEvent(_)
+            | ClientLoopEvent::ControlDisconnected => {}
             ClientLoopEvent::Timer => {}
         }
+        Ok(ControlFlow::Continue(()))
     }
-
-    // Clean exit (Ctrl+C). Send Detach before closing.
-    let detach = ClientMessage::Detach;
-    let _ = write_to_server(&mut write_stream, &detach);
-    let _ = io::stdout().flush();
-
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2137,6 +2311,67 @@ fn server_reader_thread(
             Err(err) => {
                 warn!(err = %err, "server read error");
                 let _ = event_tx.blocking_send(ClientLoopEvent::ServerDisconnected);
+                break;
+            }
+        }
+    }
+}
+
+/// Blocking thread that reads a single terminal's mirror data-plane messages and
+/// forwards them to the shared pump tagged with `terminal_id`.
+///
+/// The full mirror session runs one of these per open terminal so the pump can
+/// route each terminal's snapshot/output/close to the right local emulator
+/// (`design-mirror-tui.md` §2.1, Phase 3). It mirrors [`server_reader_thread`]
+/// but emits the tagged [`ClientLoopEvent::ServerMirror`] /
+/// [`ClientLoopEvent::ServerMirrorDisconnected`] variants.
+#[cfg(unix)]
+fn mirror_server_reader_thread(
+    mut stream: LocalStream,
+    event_tx: tokio::sync::mpsc::Sender<ClientLoopEvent>,
+    should_quit: &Arc<AtomicBool>,
+    max_frame_size: usize,
+    terminal_id: String,
+) {
+    let disconnect = |tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>| {
+        let _ = tx.blocking_send(ClientLoopEvent::ServerMirrorDisconnected {
+            terminal_id: terminal_id.clone(),
+        });
+    };
+
+    if stream.set_nonblocking(false).is_err() {
+        disconnect(&event_tx);
+        return;
+    }
+
+    loop {
+        if should_quit.load(Ordering::Acquire) {
+            break;
+        }
+
+        match protocol::read_message(&mut stream, max_frame_size) {
+            Ok(msg) => {
+                if event_tx
+                    .blocking_send(ClientLoopEvent::ServerMirror {
+                        terminal_id: terminal_id.clone(),
+                        msg,
+                    })
+                    .is_err()
+                {
+                    break; // Main loop gone.
+                }
+            }
+            Err(protocol::FramingError::UnexpectedEof) => {
+                disconnect(&event_tx);
+                break;
+            }
+            Err(protocol::FramingError::Io(err)) if err.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(1));
+                continue;
+            }
+            Err(err) => {
+                warn!(err = %err, terminal_id = %terminal_id, "mirror server read error");
+                disconnect(&event_tx);
                 break;
             }
         }
@@ -2438,6 +2673,52 @@ fn write_window_title(title: Option<&str>) {
 // ---------------------------------------------------------------------------
 // Frame output
 // ---------------------------------------------------------------------------
+
+/// Options controlling how a [`FrameData`] is blitted to the host terminal.
+struct FrameWriteOptions {
+    /// Reset the diff encoder first so the whole frame is redrawn.
+    full_redraw: bool,
+    /// Draw the cursor into the frame cells instead of using the host cursor.
+    draw_host_cursor: bool,
+    /// Emit inline Kitty graphics carried by the frame.
+    graphics_enabled: bool,
+}
+
+/// The single frame blit/write/flush path shared by every client output site
+/// (the round-trip `ServerMessage::Frame` arm and the local mirror repaint).
+///
+/// Encodes `frame` against `blit` (honoring host-cursor drawing), writes the
+/// diff plus any graphics to `out`, flushes, then commits the frame to the
+/// encoder so the next diff is computed against it (code-review Finding 3).
+fn write_frame_to_stdout(
+    out: &mut impl io::Write,
+    blit: &mut render_ansi::BlitEncoder,
+    frame: crate::protocol::FrameData,
+    opts: FrameWriteOptions,
+) -> io::Result<()> {
+    if opts.full_redraw {
+        *blit = render_ansi::BlitEncoder::new();
+    }
+    let frame = if opts.draw_host_cursor {
+        render_ansi::frame_with_drawn_cursor(frame)
+    } else {
+        frame
+    };
+    let encoded = if opts.draw_host_cursor {
+        blit.encode_with_suppressed_visible_cursor(&frame, false)
+    } else {
+        blit.encode(&frame, false)
+    };
+    let graphics: &[u8] = if opts.graphics_enabled {
+        frame.graphics.as_slice()
+    } else {
+        &[]
+    };
+    write_encoded_frame_with_graphics(&mut *out, &encoded.bytes, graphics)?;
+    out.flush()?;
+    blit.commit(frame, encoded);
+    Ok(())
+}
 
 fn write_encoded_frame_with_graphics(
     mut writer: impl io::Write,

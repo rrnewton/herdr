@@ -37,6 +37,10 @@ pub(crate) use self::keybinds::parse_key_combo;
 
 pub const CONFIG_PATH_ENV_VAR: &str = "HERDR_CONFIG_PATH";
 pub const DEFAULT_SCROLLBACK_LIMIT_BYTES: usize = 10_000_000;
+/// Default per-pane local scrollback budget for a mirror session, in bytes.
+/// This is client-side memory only; the mirror trades memory for instant local
+/// scrollback (`design-mirror-tui.md` §5).
+pub const DEFAULT_MIRROR_LOCAL_SCROLLBACK_BYTES: usize = 8 * 1024 * 1024;
 pub const DEFAULT_MOUSE_SCROLL_LINES: usize = 3;
 pub const DEFAULT_MOBILE_WIDTH_THRESHOLD: u16 = 64;
 

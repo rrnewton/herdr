@@ -43,6 +43,28 @@ pub(crate) fn terminal_direct_indexed_navigation_action(
     indexed_navigation_action(state, key, BindingDispatch::Direct)
 }
 
+/// Prefix-mode keybinding → action mapping, reused by the mirror session driver
+/// so it classifies keys with the exact same user-configured bindings the server
+/// app uses (`design-mirror-tui.md` §3.4). The mirror maps the resulting action
+/// to a local view mutation or a JSON API call rather than mutating server state.
+#[cfg(unix)]
+pub(crate) fn prefix_non_indexed_navigation_action(
+    state: &AppState,
+    key: TerminalKey,
+) -> Option<NavigateAction> {
+    non_indexed_action_for_key(state, key, BindingDispatch::Prefix)
+}
+
+/// Prefix-mode indexed (`switch_tab`/`switch_workspace`/`focus_agent`) mapping,
+/// companion to [`prefix_non_indexed_navigation_action`].
+#[cfg(unix)]
+pub(crate) fn prefix_indexed_navigation_action(
+    state: &AppState,
+    key: TerminalKey,
+) -> Option<NavigateAction> {
+    indexed_navigation_action(state, key, BindingDispatch::Prefix)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ActionContext {
     Direct,

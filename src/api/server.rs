@@ -849,6 +849,8 @@ mod tests {
             workspace_id: "ws_1".into(),
             tab_id: "tab_1".into(),
             focused: true,
+            cols: None,
+            rows: None,
             cwd: None,
             foreground_cwd: None,
             label: None,

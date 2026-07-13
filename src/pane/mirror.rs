@@ -15,9 +15,12 @@ use super::terminal::{GhosttyPaneTerminal, PaneTerminal};
 use crate::layout::PaneId;
 use crate::protocol::{CursorState, FrameData, MirrorEventKind};
 
-/// Local scrollback budget for the mirror emulator. Generous, since the point of
-/// the mirror is fast local scrollback; this is client memory only.
-const LOCAL_MIRROR_SCROLLBACK_BYTES: usize = 8 * 1024 * 1024;
+/// Default local scrollback budget for the mirror emulator when no explicit size
+/// is configured. Generous, since the point of the mirror is fast local
+/// scrollback; this is client memory only. The interactive mirror session
+/// overrides this per `config.mirror.local_scrollback_bytes`
+/// (`design-mirror-tui.md` §5).
+const LOCAL_MIRROR_SCROLLBACK_BYTES: usize = crate::config::DEFAULT_MIRROR_LOCAL_SCROLLBACK_BYTES;
 
 /// What the caller should do after applying a mirror message.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -38,16 +41,30 @@ pub(crate) struct LocalMirror {
     /// Current source terminal size (columns, rows).
     cols: u16,
     rows: u16,
+    /// Local scrollback budget in bytes, preserved across re-snapshots so a
+    /// configured size survives an `apply_snapshot` reset.
+    scrollback_bytes: usize,
     /// Highest mirror sequence applied, or `None` before the first snapshot.
     last_seq: Option<u64>,
 }
 
 impl LocalMirror {
+    /// Creates a mirror emulator with the default local scrollback budget.
     pub(crate) fn new(cols: u16, rows: u16) -> std::io::Result<Self> {
+        Self::with_scrollback(cols, rows, LOCAL_MIRROR_SCROLLBACK_BYTES)
+    }
+
+    /// Creates a mirror emulator with an explicit local scrollback budget
+    /// (`config.mirror.local_scrollback_bytes`).
+    pub(crate) fn with_scrollback(
+        cols: u16,
+        rows: u16,
+        scrollback_bytes: usize,
+    ) -> std::io::Result<Self> {
         let cols = cols.max(1);
         let rows = rows.max(1);
         let (response_tx, response_rx) = mpsc::channel::<Bytes>(64);
-        let mut ghostty = crate::ghostty::Terminal::new(cols, rows, LOCAL_MIRROR_SCROLLBACK_BYTES)
+        let mut ghostty = crate::ghostty::Terminal::new(cols, rows, scrollback_bytes)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
         ghostty
             .enable_grapheme_cluster_mode()
@@ -60,6 +77,7 @@ impl LocalMirror {
             _response_rx: response_rx,
             cols,
             rows,
+            scrollback_bytes,
             last_seq: None,
         })
     }
@@ -68,6 +86,12 @@ impl LocalMirror {
     #[cfg(test)]
     pub(crate) fn size(&self) -> (u16, u16) {
         (self.cols, self.rows)
+    }
+
+    /// The local scrollback budget, in bytes, this emulator was built with.
+    #[cfg(test)]
+    pub(crate) fn scrollback_bytes(&self) -> usize {
+        self.scrollback_bytes
     }
 
     /// Highest mirror sequence applied so far; used as the `resume_from` value on
@@ -84,7 +108,8 @@ impl LocalMirror {
         cols: u16,
         rows: u16,
     ) -> std::io::Result<MirrorApplyOutcome> {
-        *self = Self::new(cols, rows)?;
+        // Preserve the configured scrollback budget across the reset.
+        *self = Self::with_scrollback(cols, rows, self.scrollback_bytes)?;
         self.last_seq = Some(base_seq);
         Ok(MirrorApplyOutcome {
             needs_full_redraw: true,
@@ -152,13 +177,9 @@ impl LocalMirror {
             .is_some_and(|metrics| metrics.offset_from_bottom > 0)
     }
 
-    /// Whether the mirrored terminal is on the alternate screen (a full-screen
-    /// app). Used to decide whether page keys scroll locally or are forwarded to
-    /// the remote application.
-    pub(crate) fn is_alt_screen(&self) -> bool {
-        self.terminal
-            .input_state()
-            .is_some_and(|state| state.alternate_screen)
+    /// Current terminal input modes reported by the mirrored emulator.
+    pub(crate) fn input_state(&self) -> Option<crate::pane::InputState> {
+        self.terminal.input_state()
     }
 
     /// Renders the current viewport to a [`FrameData`] at the source size, using
@@ -191,6 +212,422 @@ impl LocalMirror {
     #[cfg(test)]
     pub(crate) fn visible_text(&self) -> String {
         self.terminal.visible_text()
+    }
+}
+
+/// Client-side local mirror pane. All methods delegate to the wrapped
+/// [`PaneTerminal`] (herdr's own renderer), so a mirror pane draws and queries
+/// identically to a server-owned pane (`design-mirror-tui.md` §1.4). The
+/// server-only lifecycle and input-encoding surface is intentionally absent (see
+/// [`crate::terminal::PaneView`]).
+impl crate::terminal::PaneView for LocalMirror {
+    fn render(&self, frame: &mut ratatui::Frame, area: Rect, show_cursor: bool) {
+        self.terminal.render(frame, area, show_cursor);
+    }
+
+    fn cursor_state(
+        &self,
+        _area: Rect,
+        show_cursor: bool,
+    ) -> Option<crate::pane::TerminalCursorState> {
+        let mut cursor = self.terminal.cursor_state()?;
+        // The mirror renders at its full source size, so `area` is unused; hide
+        // the cursor when the caller opts out or the viewport is scrolled back,
+        // matching `render_frame`.
+        if !show_cursor || self.is_scrolled_back() {
+            cursor.visible = false;
+        }
+        Some(cursor)
+    }
+
+    fn input_state(&self) -> Option<crate::pane::InputState> {
+        self.terminal.input_state()
+    }
+
+    fn wheel_routing(&self) -> Option<crate::pane::WheelRouting> {
+        self.terminal.wheel_routing()
+    }
+
+    fn synchronized_output_active(&self) -> bool {
+        self.terminal.synchronized_output_active()
+    }
+
+    fn current_size(&self) -> (u16, u16) {
+        // Matches the server runtime's ordering: (rows, cols).
+        (self.rows, self.cols)
+    }
+
+    fn scroll_metrics(&self) -> Option<crate::pane::ScrollMetrics> {
+        self.terminal.scroll_metrics()
+    }
+
+    fn visible_text(&self) -> String {
+        self.terminal.visible_text()
+    }
+
+    fn visible_hyperlinks(&self, area: Rect) -> Vec<((u16, u16), String, String)> {
+        self.terminal.visible_hyperlinks(area)
+    }
+
+    fn extract_selection(&self, selection: &crate::selection::Selection) -> Option<String> {
+        self.terminal.extract_selection(selection)
+    }
+
+    fn search_text_matches(
+        &self,
+        query: &str,
+        case_sensitive: bool,
+    ) -> Vec<crate::pane::TerminalTextMatch> {
+        self.terminal.search_text_matches(query, case_sensitive)
+    }
+
+    fn text_matches_are_current(
+        &self,
+        text_matches: &[crate::pane::TerminalTextMatch],
+    ) -> Vec<bool> {
+        self.terminal.text_matches_are_current(text_matches)
+    }
+
+    fn word_motion_target(
+        &self,
+        row: u32,
+        col: u16,
+        motion: crate::pane::TerminalWordMotion,
+    ) -> Option<crate::pane::TerminalTextPoint> {
+        self.terminal.word_motion_target(row, col, motion)
+    }
+
+    fn scroll_up(&self, lines: usize) {
+        self.terminal.scroll_up(lines);
+    }
+
+    fn scroll_down(&self, lines: usize) {
+        self.terminal.scroll_down(lines);
+    }
+
+    fn scroll_reset(&self) {
+        self.terminal.scroll_reset();
+    }
+
+    fn set_scroll_offset_from_bottom(&self, lines: usize) {
+        self.terminal.set_scroll_offset_from_bottom(lines);
+    }
+    // cwd/foreground_cwd default to None: a read-only mirror has no PTY cwd.
+}
+
+/// A [`LocalMirror`] behind interior mutability so it can serve as the `Mirror`
+/// variant of [`crate::terminal::TerminalRuntime`].
+///
+/// The shared render trait ([`crate::terminal::PaneView`]) takes `&self`, but the
+/// mirror is also fed sequenced data (`apply_snapshot`/`apply_event`) which needs
+/// `&mut LocalMirror`. Wrapping the emulator in a `Mutex` lets both the render
+/// path and the data-plane feed share one runtime through shared references, the
+/// same way the PTY [`crate::pane::PaneRuntime`] uses interior mutability
+/// (`design-mirror-tui.md` §1b). Methods here mirror the read/render/input-encode
+/// surface of `PaneRuntime` so the enum runtime can dispatch to either backend.
+///
+/// Constructed by the mirror connection manager in a later phase; the feed API is
+/// `#[allow(dead_code)]` until then.
+#[cfg(unix)]
+pub struct MirrorRuntime {
+    inner: std::sync::Mutex<LocalMirror>,
+}
+
+#[cfg(unix)]
+impl MirrorRuntime {
+    fn lock(&self) -> std::sync::MutexGuard<'_, LocalMirror> {
+        // A poisoned lock only means a panic happened while rendering/feeding; the
+        // emulator state is still coherent enough to read, so recover it rather
+        // than propagate the panic (matches `MirrorLog`).
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    // --- draw ---
+    pub(crate) fn render(&self, frame: &mut ratatui::Frame, area: Rect, show_cursor: bool) {
+        self.lock().terminal.render(frame, area, show_cursor);
+    }
+
+    pub(crate) fn cursor_state(
+        &self,
+        _area: Rect,
+        show_cursor: bool,
+    ) -> Option<crate::pane::TerminalCursorState> {
+        let guard = self.lock();
+        let mut cursor = guard.terminal.cursor_state()?;
+        // The mirror renders at its full source size, so `area` is unused; hide the
+        // cursor when the caller opts out or the viewport is scrolled back, matching
+        // `LocalMirror::render_frame`.
+        if !show_cursor || guard.is_scrolled_back() {
+            cursor.visible = false;
+        }
+        Some(cursor)
+    }
+
+    // --- input-relevant + viewport state queries ---
+    pub(crate) fn input_state(&self) -> Option<crate::pane::InputState> {
+        self.lock().terminal.input_state()
+    }
+
+    pub(crate) fn wheel_routing(&self) -> Option<crate::pane::WheelRouting> {
+        self.lock().terminal.wheel_routing()
+    }
+
+    pub(crate) fn synchronized_output_active(&self) -> bool {
+        self.lock().terminal.synchronized_output_active()
+    }
+
+    pub(crate) fn current_size(&self) -> (u16, u16) {
+        let guard = self.lock();
+        // Matches the server runtime's ordering: (rows, cols).
+        (guard.rows, guard.cols)
+    }
+
+    pub(crate) fn scroll_metrics(&self) -> Option<crate::pane::ScrollMetrics> {
+        self.lock().terminal.scroll_metrics()
+    }
+
+    // --- copy-mode / selection / search (read-only) ---
+    pub(crate) fn visible_text(&self) -> String {
+        self.lock().terminal.visible_text()
+    }
+
+    pub(crate) fn visible_ansi(&self) -> String {
+        self.lock().terminal.visible_ansi()
+    }
+
+    pub(crate) fn detection_text(&self) -> String {
+        self.lock().terminal.detection_text()
+    }
+
+    pub(crate) fn agent_osc_title(&self) -> String {
+        self.lock().terminal.agent_osc_title()
+    }
+
+    pub(crate) fn agent_osc_progress(&self) -> String {
+        self.lock().terminal.agent_osc_progress()
+    }
+
+    pub(crate) fn recent_text(&self, lines: usize) -> String {
+        self.lock().terminal.recent_text(lines)
+    }
+
+    pub(crate) fn recent_ansi(&self, lines: usize) -> String {
+        self.lock().terminal.recent_ansi(lines)
+    }
+
+    pub(crate) fn recent_unwrapped_text(&self, lines: usize) -> String {
+        self.lock().terminal.recent_unwrapped_text(lines)
+    }
+
+    pub(crate) fn recent_unwrapped_ansi(&self, lines: usize) -> String {
+        self.lock().terminal.recent_unwrapped_ansi(lines)
+    }
+
+    pub(crate) fn extract_selection(
+        &self,
+        selection: &crate::selection::Selection,
+    ) -> Option<String> {
+        self.lock().terminal.extract_selection(selection)
+    }
+
+    pub(crate) fn search_text_matches(
+        &self,
+        query: &str,
+        case_sensitive: bool,
+    ) -> Vec<crate::pane::TerminalTextMatch> {
+        self.lock()
+            .terminal
+            .search_text_matches(query, case_sensitive)
+    }
+
+    pub(crate) fn text_match_is_current(&self, text_match: crate::pane::TerminalTextMatch) -> bool {
+        self.lock().terminal.text_match_is_current(text_match)
+    }
+
+    pub(crate) fn text_matches_are_current(
+        &self,
+        text_matches: &[crate::pane::TerminalTextMatch],
+    ) -> Vec<bool> {
+        self.lock().terminal.text_matches_are_current(text_matches)
+    }
+
+    pub(crate) fn word_motion_target(
+        &self,
+        row: u32,
+        col: u16,
+        motion: crate::pane::TerminalWordMotion,
+    ) -> Option<crate::pane::TerminalTextPoint> {
+        self.lock().terminal.word_motion_target(row, col, motion)
+    }
+
+    pub(crate) fn visible_hyperlinks(&self, area: Rect) -> Vec<((u16, u16), String, String)> {
+        self.lock().terminal.visible_hyperlinks(area)
+    }
+
+    pub(crate) fn kitty_image_placements_with_data_filter<F>(
+        &self,
+        needs_data: F,
+    ) -> Vec<crate::ghostty::KittyImagePlacement>
+    where
+        F: FnMut(crate::ghostty::KittyImageDescriptor) -> bool,
+    {
+        self.lock()
+            .terminal
+            .kitty_image_placements_with_data_filter(needs_data)
+    }
+
+    // --- local viewport scroll (no network) ---
+    pub(crate) fn scroll_up(&self, lines: usize) {
+        self.lock().terminal.scroll_up(lines);
+    }
+
+    pub(crate) fn scroll_down(&self, lines: usize) {
+        self.lock().terminal.scroll_down(lines);
+    }
+
+    pub(crate) fn scroll_reset(&self) {
+        self.lock().terminal.scroll_reset();
+    }
+
+    pub(crate) fn set_scroll_offset_from_bottom(&self, lines: usize) {
+        self.lock().terminal.set_scroll_offset_from_bottom(lines);
+    }
+
+    // --- input byte encoding ---
+    //
+    // The mirror never writes to a PTY; the app driver forwards these encoded
+    // bytes over the network for the focused pane (`design-mirror-tui.md` §3.4).
+    // The encoding still depends on the mirrored terminal's own modes, so it is
+    // computed from the local emulator.
+    pub(crate) fn keyboard_protocol(&self) -> crate::input::KeyboardProtocol {
+        self.lock()
+            .terminal
+            .keyboard_protocol(crate::input::KeyboardProtocol::Legacy)
+    }
+
+    pub(crate) fn encode_terminal_key(&self, key: crate::input::TerminalKey) -> Vec<u8> {
+        let guard = self.lock();
+        let protocol = guard
+            .terminal
+            .keyboard_protocol(crate::input::KeyboardProtocol::Legacy);
+        guard.terminal.encode_terminal_key(key, protocol)
+    }
+
+    pub(crate) fn encode_mouse_button(
+        &self,
+        kind: crossterm::event::MouseEventKind,
+        column: u16,
+        row: u16,
+        modifiers: crossterm::event::KeyModifiers,
+    ) -> Option<Vec<u8>> {
+        self.lock()
+            .terminal
+            .encode_mouse_button(kind, column, row, modifiers)
+    }
+
+    pub(crate) fn encode_mouse_motion(
+        &self,
+        kind: crossterm::event::MouseEventKind,
+        column: u16,
+        row: u16,
+        modifiers: crossterm::event::KeyModifiers,
+    ) -> Option<Vec<u8>> {
+        self.lock()
+            .terminal
+            .encode_mouse_motion(kind, column, row, modifiers)
+    }
+
+    pub(crate) fn encode_mouse_wheel(
+        &self,
+        kind: crossterm::event::MouseEventKind,
+        column: u16,
+        row: u16,
+        modifiers: crossterm::event::KeyModifiers,
+    ) -> Option<Vec<u8>> {
+        self.lock()
+            .terminal
+            .encode_mouse_wheel(kind, column, row, modifiers)
+    }
+
+    pub(crate) fn encode_alternate_scroll(
+        &self,
+        kind: crossterm::event::MouseEventKind,
+    ) -> Option<Vec<u8>> {
+        let guard = self.lock();
+        if guard.terminal.wheel_routing()? != crate::pane::WheelRouting::AlternateScroll {
+            return None;
+        }
+        let key = match kind {
+            crossterm::event::MouseEventKind::ScrollUp => crossterm::event::KeyCode::Up,
+            crossterm::event::MouseEventKind::ScrollDown => crossterm::event::KeyCode::Down,
+            _ => return None,
+        };
+        let protocol = guard
+            .terminal
+            .keyboard_protocol(crate::input::KeyboardProtocol::Legacy);
+        Some(guard.terminal.encode_terminal_key(
+            crate::input::TerminalKey::new(key, crossterm::event::KeyModifiers::empty()),
+            protocol,
+        ))
+    }
+}
+
+/// Data-plane feed and lifecycle. Not yet wired up: the mirror connection manager
+/// that drives these lands in a later phase (`design-mirror-tui.md` §6, Phase 3).
+#[cfg(unix)]
+#[allow(dead_code)]
+impl MirrorRuntime {
+    /// Creates a mirror runtime with a fresh emulator at the given source size
+    /// and the default local scrollback budget.
+    pub(crate) fn new(cols: u16, rows: u16) -> std::io::Result<Self> {
+        Ok(Self {
+            inner: std::sync::Mutex::new(LocalMirror::new(cols, rows)?),
+        })
+    }
+
+    /// Creates a mirror runtime with an explicit local scrollback budget
+    /// (`config.mirror.local_scrollback_bytes`).
+    pub(crate) fn with_scrollback(
+        cols: u16,
+        rows: u16,
+        scrollback_bytes: usize,
+    ) -> std::io::Result<Self> {
+        Ok(Self {
+            inner: std::sync::Mutex::new(LocalMirror::with_scrollback(
+                cols,
+                rows,
+                scrollback_bytes,
+            )?),
+        })
+    }
+
+    /// Wraps an already-constructed [`LocalMirror`].
+    pub(crate) fn from_local_mirror(mirror: LocalMirror) -> Self {
+        Self {
+            inner: std::sync::Mutex::new(mirror),
+        }
+    }
+
+    /// Applies a `MirrorSnapshot`, re-establishing the emulator at the source size.
+    pub(crate) fn apply_snapshot(
+        &self,
+        base_seq: u64,
+        cols: u16,
+        rows: u16,
+    ) -> std::io::Result<MirrorApplyOutcome> {
+        self.lock().apply_snapshot(base_seq, cols, rows)
+    }
+
+    /// Applies one sequenced mirror event.
+    pub(crate) fn apply_event(&self, seq: u64, kind: MirrorEventKind) -> MirrorApplyOutcome {
+        self.lock().apply_event(seq, kind)
+    }
+
+    /// Highest mirror sequence applied so far; used as `resume_from` on reconnect.
+    pub(crate) fn last_seq(&self) -> Option<u64> {
+        self.lock().last_seq()
     }
 }
 
@@ -235,6 +672,19 @@ mod tests {
     }
 
     #[test]
+    fn configured_scrollback_survives_resnapshot() {
+        // A configured (non-default) scrollback budget must be preserved when a
+        // fresh snapshot resets the emulator, so a reconnect/resnapshot does not
+        // silently revert a mirror pane to the default memory budget.
+        let custom = 512 * 1024;
+        let mut mirror = LocalMirror::with_scrollback(20, 4, custom).unwrap();
+        assert_eq!(mirror.scrollback_bytes(), custom);
+        mirror.apply_snapshot(0, 40, 10).unwrap();
+        assert_eq!(mirror.scrollback_bytes(), custom);
+        assert_eq!(mirror.size(), (40, 10));
+    }
+
+    #[test]
     fn closed_event_is_reported() {
         let mut mirror = LocalMirror::new(20, 4).unwrap();
         mirror.apply_snapshot(0, 20, 4).unwrap();
@@ -263,6 +713,60 @@ mod tests {
         // An earlier line is now visible in the viewport.
         assert!(scrolled.contains("line"));
         mirror.scroll_to_bottom();
+        assert!(!mirror.is_scrolled_back());
+    }
+
+    #[test]
+    fn scroll_metrics_drive_the_scrollbar_decoration() {
+        use crate::terminal::PaneView;
+
+        // The pane scrollbar is rendered from `PaneView::scroll_metrics`; a mirror
+        // pane must report a growing offset as it is scrolled back so the existing
+        // `render_pane_scrollbar` path decorates it exactly like a PTY pane.
+        let mut mirror = LocalMirror::new(20, 4).unwrap();
+        mirror.apply_snapshot(0, 20, 4).unwrap();
+        for i in 0..50u64 {
+            mirror.apply_event(
+                i + 1,
+                MirrorEventKind::Output(format!("line{i}\r\n").into_bytes()),
+            );
+        }
+
+        // At the live edge, there is no scrollback offset.
+        let bottom = PaneView::scroll_metrics(&mirror).expect("metrics at bottom");
+        assert_eq!(bottom.offset_from_bottom, 0);
+        assert!(bottom.max_offset_from_bottom > 0, "scrollback is available");
+
+        // Scrolling back reports a non-zero offset that the scrollbar renders.
+        PaneView::scroll_up(&mirror, 10);
+        let scrolled = PaneView::scroll_metrics(&mirror).expect("metrics while scrolled back");
+        assert!(scrolled.offset_from_bottom > 0);
+        assert!(scrolled.offset_from_bottom <= scrolled.max_offset_from_bottom);
+    }
+
+    #[test]
+    fn local_mirror_is_a_pane_view() {
+        use crate::terminal::PaneView;
+
+        let mut mirror = LocalMirror::new(20, 4).unwrap();
+        mirror.apply_snapshot(0, 20, 4).unwrap();
+        for i in 0..50u64 {
+            mirror.apply_event(
+                i + 1,
+                MirrorEventKind::Output(format!("line{i}\r\n").into_bytes()),
+            );
+        }
+
+        // Read surface works through the shared trait; size is (rows, cols).
+        assert_eq!(PaneView::current_size(&mirror), (4, 20));
+        assert!(!PaneView::is_alt_screen(&mirror));
+        assert!(PaneView::visible_text(&mirror).contains("line49"));
+
+        // Local scroll through the trait moves the viewport with no new events.
+        assert!(!mirror.is_scrolled_back());
+        PaneView::scroll_up(&mirror, 20);
+        assert!(mirror.is_scrolled_back());
+        PaneView::scroll_reset(&mirror);
         assert!(!mirror.is_scrolled_back());
     }
 }

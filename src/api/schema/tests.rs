@@ -458,7 +458,7 @@ fn subscribe_request_parses_parameterized_subscriptions() {
     assert!(matches!(
         &params.subscriptions[1],
         Subscription::PaneAgentStatusChanged {
-            pane_id,
+            pane_id: Some(pane_id),
             agent_status: Some(AgentStatus::Done),
         } if pane_id == "p_1_1"
     ));
@@ -620,6 +620,8 @@ fn worktree_request_and_response_round_trip() {
                 workspace_id: "w_1".into(),
                 tab_id: "w_1:1".into(),
                 focused: true,
+                cols: None,
+                rows: None,
                 cwd: Some("/worktrees/herdr/worktree-api".into()),
                 foreground_cwd: None,
                 label: None,
@@ -1033,6 +1035,8 @@ fn create_response_round_trips_with_root_pane() {
                 workspace_id: "w_1".into(),
                 tab_id: "w_1:2".into(),
                 focused: false,
+                cols: None,
+                rows: None,
                 cwd: Some("/tmp/review".into()),
                 foreground_cwd: None,
                 label: None,
