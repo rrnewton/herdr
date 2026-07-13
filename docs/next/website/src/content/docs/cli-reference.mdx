@@ -197,14 +197,41 @@ herdr pane send-keys <pane_id> <key> [key ...]
 herdr pane run <pane_id> <command>
 ```
 
-`<key>` uses Herdr key-combo syntax: plain printable keys such as `a`,
-special keys such as `enter`, `tab`, `esc`, `backspace`, `left`, `right`,
-`up`, and `down`, modifier chords such as `ctrl+h`, `control+j`, `alt+x`,
-and `shift+tab`, function keys such as `f1`, and named punctuation such as
-`minus`, `plus`, and `backtick`. Legacy `C-c` and `c-c` are accepted as
-aliases for `ctrl+c`.
+`send-text` types text into the pane exactly as if the bytes were entered at
+the keyboard. Arguments after `<pane_id>` are joined with single spaces and
+sent verbatim: escape sequences such as `\n` are **not** interpreted, and no
+Enter/newline is appended, so the text is typed but not submitted. To submit a
+command, use `pane run` (which appends Enter), follow the `send-text` with
+`send-keys <pane_id> enter`, or embed a real newline in the argument (for
+example bash/zsh `$'ls -la\n'`).
+
+`send-keys` presses one or more keys. Each argument is a single key chord and
+the chords are sent in order. A chord is zero or more modifiers plus one key
+joined with `+`, and names are case-insensitive:
+
+- **modifiers:** `ctrl` (`control`), `shift`, `alt` (`option`, `meta`),
+  `cmd` (`command`, `super`), `hyper`.
+- **keys:** any single character (`a`, `7`, `/`; an uppercase letter implies
+  `shift`); named keys `enter`/`return`, `esc`/`escape`, `tab` (`shift+tab`
+  sends back-tab), `backspace`/`bs`, `space`, `up`, `down`, `left`, `right`;
+  punctuation words `minus`, `comma`, `period`, `slash`, `backslash`, `quote`,
+  `double_quote`, `semicolon`, `colon`, `percent`, `ampersand`, `backtick`,
+  `plus`; and function keys `f1`–`f12`.
+
+Legacy `C-c` and `c-c` are accepted as aliases for `ctrl+c`, and a bare `+`
+means the `plus` key. If any argument is not a valid key, no keys are sent and
+the command reports `unsupported key <key>`.
 
 `pane run` submits text plus Enter atomically. Prefer it over `send-text` plus `send-keys Enter` for commands.
+
+Examples:
+
+```bash
+herdr pane send-text <pane_id> 'git commit -m '   # type without submitting
+herdr pane run <pane_id> 'ls -la'                 # type a command and run it
+herdr pane send-keys <pane_id> ctrl+c             # interrupt the foreground process
+herdr pane send-keys <pane_id> up up enter        # recall a previous command and run it
+```
 
 Report agent state from custom hooks:
 

@@ -905,8 +905,12 @@ fn pane_close(args: &[String]) -> std::io::Result<i32> {
 }
 
 fn pane_send_text(args: &[String]) -> std::io::Result<i32> {
+    if wants_help(args.first()) {
+        print_send_text_help();
+        return Ok(0);
+    }
     if args.len() < 2 {
-        eprintln!("usage: herdr pane send-text <pane_id> <text>");
+        print_send_text_help();
         return Ok(2);
     }
 
@@ -916,14 +920,79 @@ fn pane_send_text(args: &[String]) -> std::io::Result<i32> {
 }
 
 fn pane_send_keys(args: &[String]) -> std::io::Result<i32> {
+    if wants_help(args.first()) {
+        print_send_keys_help();
+        return Ok(0);
+    }
     if args.len() < 2 {
-        eprintln!("usage: herdr pane send-keys <pane_id> <key> [key ...]");
+        print_send_keys_help();
         return Ok(2);
     }
 
     let pane_id = super::normalize_pane_id(&args[0]);
     let keys = args[1..].to_vec();
     super::send_ok_request(Method::PaneSendKeys(PaneSendKeysParams { pane_id, keys }))
+}
+
+/// True when the first argument is a help flag (`-h`, `--help`, or `help`).
+fn wants_help(first: Option<&String>) -> bool {
+    matches!(first.map(String::as_str), Some("-h" | "--help" | "help"))
+}
+
+fn print_send_text_help() {
+    eprintln!("usage: herdr pane send-text <pane_id> <text>...");
+    eprintln!();
+    eprintln!("Type text into a pane, exactly as if the bytes were entered at the keyboard.");
+    eprintln!("Every argument after <pane_id> is joined with single spaces and sent verbatim.");
+    eprintln!();
+    eprintln!("The text is sent literally:");
+    eprintln!("  - escape sequences such as \\n or \\t are NOT interpreted (a literal '\\' 'n');");
+    eprintln!("  - no Enter/newline is appended, so the text is typed but not submitted.");
+    eprintln!();
+    eprintln!("To submit a command (press Enter), use one of:");
+    eprintln!("  herdr pane run <pane_id> <command>       # types the text and presses Enter");
+    eprintln!("  herdr pane send-keys <pane_id> enter      # press Enter after a send-text");
+    eprintln!("  herdr pane send-text <pane_id> $'cmd\\n'   # bash/zsh: embed a real newline");
+    eprintln!();
+    eprintln!("examples:");
+    eprintln!("  herdr pane send-text <pane_id> 'hello world'");
+    eprintln!("  herdr pane send-text <pane_id> 'git commit -m '   # leaves the cursor mid-line");
+    eprintln!("  herdr pane run <pane_id> 'ls -la'                 # type and run in one step");
+    eprintln!();
+    eprintln!("<pane_id> is a pane id (see `herdr pane list`).");
+}
+
+fn print_send_keys_help() {
+    eprintln!("usage: herdr pane send-keys <pane_id> <key> [key ...]");
+    eprintln!();
+    eprintln!("Press one or more keys in a pane. Each argument is a single key chord, and the");
+    eprintln!("chords are sent in order. A chord is zero or more modifiers and one key joined");
+    eprintln!("with '+', for example `ctrl+c`, `alt+shift+f`, or just `enter`. Names are");
+    eprintln!("case-insensitive.");
+    eprintln!();
+    eprintln!("modifiers:");
+    eprintln!("  ctrl (control), shift, alt (option, meta), cmd (command, super), hyper");
+    eprintln!();
+    eprintln!("keys:");
+    eprintln!("  - any single character: a b 7 / ? (an uppercase letter implies shift)");
+    eprintln!("  - named: enter (return), esc (escape), tab, backspace (bs), space,");
+    eprintln!("           up, down, left, right");
+    eprintln!("  - punctuation words: minus comma period slash backslash quote double_quote");
+    eprintln!("           semicolon colon percent ampersand backtick plus");
+    eprintln!("  - function keys: f1, f2, ... f12");
+    eprintln!();
+    eprintln!("aliases: `C-c` (and `c-c`) mean `ctrl+c`; a bare `+` means the plus key.");
+    eprintln!();
+    eprintln!("If any argument is not a valid key, no keys are sent and the command reports");
+    eprintln!("`unsupported key <key>`.");
+    eprintln!();
+    eprintln!("examples:");
+    eprintln!("  herdr pane send-keys <pane_id> enter          # press Enter");
+    eprintln!("  herdr pane send-keys <pane_id> ctrl+c         # interrupt (Ctrl-C)");
+    eprintln!("  herdr pane send-keys <pane_id> up up enter    # recall a command and run it");
+    eprintln!("  herdr pane send-keys <pane_id> escape : w q enter   # vim :wq");
+    eprintln!();
+    eprintln!("<pane_id> is a pane id (see `herdr pane list`).");
 }
 
 fn pane_run(args: &[String]) -> std::io::Result<i32> {
@@ -1431,8 +1500,10 @@ fn print_pane_help() {
     eprintln!("  herdr pane move <pane_id> --new-tab [--workspace ID] [--label TEXT] [--focus|--no-focus]");
     eprintln!("  herdr pane move <pane_id> --new-workspace [--label TEXT] [--tab-label TEXT] [--focus|--no-focus]");
     eprintln!("  herdr pane close <pane_id>");
-    eprintln!("  herdr pane send-text <pane_id> <text>");
-    eprintln!("  herdr pane send-keys <pane_id> <key> [key ...]");
+    eprintln!(
+        "  herdr pane send-text <pane_id> <text>  (types verbatim, no Enter; see send-text --help)"
+    );
+    eprintln!("  herdr pane send-keys <pane_id> <key> [key ...]  (key chords e.g. enter, ctrl+c; see send-keys --help)");
     eprintln!("  herdr pane report-agent <pane_id> --source ID --agent LABEL --state idle|working|blocked|unknown [--message TEXT] [--custom-status TEXT] [--seq N] [--agent-session-id ID] [--agent-session-path PATH]");
     eprintln!("  herdr pane report-agent-session <pane_id> --source ID --agent LABEL [--seq N] [--agent-session-id ID] [--agent-session-path PATH]");
     eprintln!("  herdr pane release-agent <pane_id> --source ID --agent LABEL [--seq N]");
@@ -1446,6 +1517,31 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn wants_help_detects_help_flags() {
+        assert!(wants_help(Some(&"--help".to_string())));
+        assert!(wants_help(Some(&"-h".to_string())));
+        assert!(wants_help(Some(&"help".to_string())));
+        assert!(!wants_help(Some(&"%1".to_string())));
+        assert!(!wants_help(None));
+    }
+
+    #[test]
+    fn send_text_and_keys_help_flag_exit_zero_without_contacting_server() {
+        // The help path must return before any request is sent, so these are safe
+        // to call with no server running.
+        assert_eq!(pane_send_text(&args(&["--help"])).unwrap(), 0);
+        assert_eq!(pane_send_text(&args(&["-h"])).unwrap(), 0);
+        assert_eq!(pane_send_keys(&args(&["help"])).unwrap(), 0);
+    }
+
+    #[test]
+    fn send_text_and_keys_missing_operands_return_usage_code() {
+        // Only a pane id, no text/keys: prints usage and exits 2 without a request.
+        assert_eq!(pane_send_text(&args(&["%1"])).unwrap(), 2);
+        assert_eq!(pane_send_keys(&args(&["%1"])).unwrap(), 2);
     }
 
     #[test]
