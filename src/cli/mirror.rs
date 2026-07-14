@@ -16,9 +16,19 @@
 //! data-plane socket from it (`server::socket_paths::client_socket_path`), so a
 //! single forwarded pair is enough.
 //!
-//! The discovery and tunnel steps are two separate `ssh` invocations, so they
-//! share an SSH `ControlMaster` connection (see `CONTROL_PATH`) to authenticate
-//! once — otherwise a host with 2FA would prompt twice.
+//! The discovery and tunnel steps are two separate `ssh` invocations. By default
+//! they authenticate independently — on a 2FA host that means up to two prompts,
+//! but both happen *before* the mirror TUI launches, so they can never corrupt
+//! the running UI.
+//!
+//! `--controlmaster` opts into SSH connection multiplexing so the two steps share
+//! a single authenticated connection (one 2FA prompt). This is **off by default**
+//! because a persisted master can later need to re-authenticate, and that prompt
+//! would render straight into the mirror TUI — which shares the terminal with the
+//! SSH children — corrupting the screen. When enabled we mitigate that by keeping
+//! the master alive for the whole session (`ControlPersist=yes`, no expiry timer)
+//! on a private control path, and tearing it down explicitly on exit, so no
+//! re-auth is triggered mid-session.
 //!
 //! This is purely a client-side launcher — it adds no server state or protocol.
 //! It relies on OpenSSH ≥ 6.7 Unix-domain-socket forwarding, so it is gated to
@@ -35,11 +45,20 @@ command. Discovers the remote server socket, forwards it over SSH, and starts
 options (before <host>):
   --remote-herdr <path>   herdr executable to run on the remote (default: herdr)
   --remote-socket <path>  remote API socket path, skipping auto-discovery
+  --controlmaster         share one SSH connection for discovery + tunnel so a
+                          2FA host prompts once (off by default; see below)
+  --no-controlmaster      disable SSH connection sharing (the default)
   -h, --help              show this help
 
 Any arguments after <host> are passed through to ssh, e.g.:
   herdr mirror devbox
   herdr mirror devbox -p 2222 -i ~/.ssh/id_ed25519
+  herdr mirror --controlmaster devbox      # one 2FA prompt, not two
+
+ControlMaster is off by default: sharing a persisted SSH connection can make a
+later re-authentication prompt appear inside the mirror TUI and corrupt it. Use
+--controlmaster only if a second auth prompt at startup is more annoying than
+that risk.
 
 Requires OpenSSH >= 6.7 (Unix-domain-socket forwarding) on both ends.";
 
@@ -54,6 +73,9 @@ pub(super) struct MirrorArgs {
     pub remote_herdr: String,
     /// Explicit remote API socket path; when set, discovery is skipped.
     pub remote_socket: Option<String>,
+    /// Opt into SSH `ControlMaster` multiplexing (single auth). Off by default
+    /// because a mid-session re-auth prompt would corrupt the mirror TUI.
+    pub control_master: bool,
 }
 
 /// Outcome of parsing that is not a ready-to-run [`MirrorArgs`].
@@ -73,6 +95,7 @@ pub(super) fn parse_mirror_args(args: &[String]) -> Result<MirrorArgs, ParseOutc
     let mut ssh_args: Vec<String> = Vec::new();
     let mut remote_herdr = "herdr".to_string();
     let mut remote_socket: Option<String> = None;
+    let mut control_master = false;
 
     let mut index = 0;
     while index < args.len() {
@@ -101,6 +124,14 @@ pub(super) fn parse_mirror_args(args: &[String]) -> Result<MirrorArgs, ParseOutc
                 remote_socket = Some(value.clone());
                 index += 2;
             }
+            "--controlmaster" => {
+                control_master = true;
+                index += 1;
+            }
+            "--no-controlmaster" => {
+                control_master = false;
+                index += 1;
+            }
             other if other.starts_with('-') => {
                 eprintln!("unknown option: {other}");
                 return Err(ParseOutcome::Usage(2));
@@ -118,6 +149,7 @@ pub(super) fn parse_mirror_args(args: &[String]) -> Result<MirrorArgs, ParseOutc
             ssh_args,
             remote_herdr,
             remote_socket,
+            control_master,
         }),
         None => {
             eprintln!("missing <host>");
@@ -179,7 +211,7 @@ mod unix_impl {
     use std::io;
     use std::os::unix::net::UnixStream;
     use std::path::{Path, PathBuf};
-    use std::process::{Child, Command};
+    use std::process::{Child, Command, Stdio};
     use std::time::{Duration, Instant};
 
     use super::{parse_mirror_args, parse_status_json, MirrorArgs, ParseOutcome, MIRROR_USAGE};
@@ -187,12 +219,53 @@ mod unix_impl {
     /// How long to wait for a forwarded socket to become connectable.
     const FORWARD_READY_TIMEOUT: Duration = Duration::from_secs(15);
 
-    /// Shared SSH `ControlPath` for connection multiplexing. The discovery SSH
-    /// opens a master connection here (`ControlMaster=auto`, kept alive briefly
-    /// with `ControlPersist`); the tunnel SSH reuses it, so the user only
-    /// authenticates (e.g. 2FA) once instead of per connection. `%h` expands to
-    /// the remote host so distinct hosts get distinct control sockets.
-    const CONTROL_PATH: &str = "/tmp/herdr-ssh-%h";
+    /// Opt-in SSH connection multiplexing (`--controlmaster`). When present, the
+    /// discovery SSH opens a master connection at [`ControlMasterConfig::path`]
+    /// and the tunnel SSH reuses it, so a 2FA host authenticates once rather than
+    /// per connection.
+    ///
+    /// This is deliberately *not* the default: a persisted master that later has
+    /// to re-authenticate would print its prompt into the mirror TUI (SSH shares
+    /// the terminal) and corrupt the screen. We keep the opt-in path safe by
+    /// persisting the master for the whole session (`ControlPersist=yes`, no
+    /// expiry timer) on a private per-process path, and closing it explicitly on
+    /// exit — so no mid-session re-auth is ever triggered.
+    struct ControlMasterConfig {
+        /// SSH `ControlPath`. `%h` expands to the remote host so distinct hosts
+        /// get distinct sockets; the pid keeps concurrent launchers isolated and
+        /// avoids reusing a stale master left by an earlier run.
+        path: String,
+    }
+
+    impl ControlMasterConfig {
+        /// A fresh, private control path for this launcher process.
+        fn new() -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("herdr-mirror-cm-{}-%h", std::process::id()))
+                .to_string_lossy()
+                .into_owned();
+            Self { path }
+        }
+
+        /// Add the options that *create or reuse* the master (discovery step).
+        fn apply_master(&self, command: &mut Command) {
+            command
+                .arg("-o")
+                .arg("ControlMaster=auto")
+                .arg("-o")
+                .arg(format!("ControlPath={}", self.path))
+                // `yes`, not a timeout: the master lives for the whole session
+                // and is torn down explicitly, so it never expires and re-auths
+                // mid-session (which would corrupt the TUI).
+                .arg("-o")
+                .arg("ControlPersist=yes");
+        }
+
+        /// Add the options that *attach to* the existing master (tunnel step).
+        fn apply_client(&self, command: &mut Command) {
+            command.arg("-o").arg(format!("ControlPath={}", self.path));
+        }
+    }
 
     pub(crate) fn run_mirror_command(args: &[String]) -> io::Result<i32> {
         let parsed = match parse_mirror_args(args) {
@@ -218,12 +291,18 @@ mod unix_impl {
             ssh_args,
             remote_herdr,
             remote_socket,
+            control_master,
         } = parsed;
+
+        // Opt-in SSH multiplexing so discovery + tunnel share one auth. Off by
+        // default (see `ControlMasterConfig`); when off, each `ssh` authenticates
+        // on its own, but always before the TUI starts.
+        let control = control_master.then(ControlMasterConfig::new);
 
         // 1. Resolve the remote API socket (explicit override or discovery).
         let remote_api_socket = match remote_socket {
             Some(socket) => socket,
-            None => discover_remote_socket(&host, &ssh_args, &remote_herdr)?,
+            None => discover_remote_socket(&host, &ssh_args, &remote_herdr, control.as_ref())?,
         };
         let remote_client_socket =
             crate::server::socket_paths::derive_client_socket_from_api_socket(Path::new(
@@ -249,10 +328,18 @@ mod unix_impl {
             &remote_api_socket,
             &local_client_socket,
             &remote_client_socket.to_string_lossy(),
+            control.as_ref(),
         )?;
         let mut guard = TunnelGuard {
             ssh: ssh_child,
             sockets: vec![local_api_socket.clone(), local_client_socket.clone()],
+            // On exit, close the shared master (if any) so no ssh process is left
+            // holding an authenticated connection.
+            control_master: control.map(|control| ControlMasterTeardown {
+                control_path: control.path,
+                host: host.clone(),
+                ssh_args: ssh_args.clone(),
+            }),
         };
 
         // 4. Wait for the forwarded sockets to come up (or SSH to fail).
@@ -279,19 +366,18 @@ mod unix_impl {
         host: &str,
         ssh_args: &[String],
         remote_herdr: &str,
+        control: Option<&ControlMasterConfig>,
     ) -> io::Result<String> {
         eprintln!("herdr mirror: discovering herdr server on {host}…");
-        // Open a multiplexed master connection so the tunnel SSH can reuse it
-        // without a second authentication (avoids a double 2FA prompt). The
-        // master persists briefly after this command so the tunnel can attach.
-        let output = Command::new("ssh")
-            .args(ssh_args)
-            .arg("-o")
-            .arg("ControlMaster=auto")
-            .arg("-o")
-            .arg(format!("ControlPath={CONTROL_PATH}"))
-            .arg("-o")
-            .arg("ControlPersist=30")
+        let mut command = Command::new("ssh");
+        command.args(ssh_args);
+        // With `--controlmaster`, open a multiplexed master here so the tunnel
+        // SSH can reuse it without a second authentication (single 2FA prompt).
+        // The master persists for the whole session and is closed on exit.
+        if let Some(control) = control {
+            control.apply_master(&mut command);
+        }
+        let output = command
             .arg(host)
             .arg(remote_herdr)
             .arg("status")
@@ -328,13 +414,16 @@ mod unix_impl {
         remote_api: &str,
         local_client: &Path,
         remote_client: &str,
+        control: Option<&ControlMasterConfig>,
     ) -> io::Result<Child> {
-        Command::new("ssh")
-            .args(ssh_args)
-            // Reuse the discovery SSH's master connection (same ControlPath) so
-            // the tunnel does not trigger a second authentication / 2FA prompt.
-            .arg("-o")
-            .arg(format!("ControlPath={CONTROL_PATH}"))
+        let mut command = Command::new("ssh");
+        command.args(ssh_args);
+        // With `--controlmaster`, reuse the discovery SSH's master connection
+        // (same ControlPath) so the tunnel does not trigger a second auth prompt.
+        if let Some(control) = control {
+            control.apply_client(&mut command);
+        }
+        command
             .arg("-N")
             .arg("-o")
             .arg("ExitOnForwardFailure=yes")
@@ -387,17 +476,42 @@ mod unix_impl {
         let _ = std::fs::remove_file(path);
     }
 
-    /// Kills the SSH tunnel and removes the temporary local sockets on drop, so
-    /// every exit path (success, error, or panic) cleans up.
+    /// What [`TunnelGuard`] needs to close a `--controlmaster` master on exit.
+    struct ControlMasterTeardown {
+        control_path: String,
+        host: String,
+        ssh_args: Vec<String>,
+    }
+
+    /// Kills the SSH tunnel, closes the shared master (if any), and removes the
+    /// temporary local sockets on drop, so every exit path (success, error, or
+    /// panic) cleans up.
     struct TunnelGuard {
         ssh: Child,
         sockets: Vec<PathBuf>,
+        control_master: Option<ControlMasterTeardown>,
     }
 
     impl Drop for TunnelGuard {
         fn drop(&mut self) {
             let _ = self.ssh.kill();
             let _ = self.ssh.wait();
+            // Explicitly close the shared master so no authenticated ssh process
+            // lingers past this launcher (`ControlPersist=yes` would otherwise
+            // keep it alive). Best-effort and silent.
+            if let Some(control) = &self.control_master {
+                let _ = Command::new("ssh")
+                    .args(&control.ssh_args)
+                    .arg("-o")
+                    .arg(format!("ControlPath={}", control.control_path))
+                    .arg("-O")
+                    .arg("exit")
+                    .arg(&control.host)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
             for socket in &self.sockets {
                 let _ = std::fs::remove_file(socket);
             }
@@ -420,6 +534,41 @@ mod tests {
         assert!(parsed.ssh_args.is_empty());
         assert_eq!(parsed.remote_herdr, "herdr");
         assert_eq!(parsed.remote_socket, None);
+        // ControlMaster is opt-in, so it must default to off.
+        assert!(!parsed.control_master);
+    }
+
+    #[test]
+    fn controlmaster_flag_opts_in() {
+        let parsed = parse_mirror_args(&args(&["--controlmaster", "devbox"])).unwrap();
+        assert_eq!(parsed.host, "devbox");
+        assert!(parsed.control_master);
+        assert!(parsed.ssh_args.is_empty());
+    }
+
+    #[test]
+    fn no_controlmaster_flag_keeps_it_off() {
+        let parsed = parse_mirror_args(&args(&["--no-controlmaster", "devbox"])).unwrap();
+        assert!(!parsed.control_master);
+    }
+
+    #[test]
+    fn last_controlmaster_flag_wins() {
+        let on =
+            parse_mirror_args(&args(&["--no-controlmaster", "--controlmaster", "devbox"])).unwrap();
+        assert!(on.control_master);
+        let off =
+            parse_mirror_args(&args(&["--controlmaster", "--no-controlmaster", "devbox"])).unwrap();
+        assert!(!off.control_master);
+    }
+
+    #[test]
+    fn controlmaster_after_host_is_ssh_passthrough() {
+        // A `--controlmaster` after the host is an ssh arg, not a herdr flag.
+        let parsed = parse_mirror_args(&args(&["devbox", "--controlmaster"])).unwrap();
+        assert_eq!(parsed.host, "devbox");
+        assert!(!parsed.control_master);
+        assert_eq!(parsed.ssh_args, args(&["--controlmaster"]));
     }
 
     #[test]
