@@ -307,6 +307,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 struct WireProxy {
     api_path: PathBuf,
     latency: Arc<Mutex<Duration>>,
+    api_latency: Arc<Mutex<Duration>>,
     data_streams: Arc<Mutex<Vec<UnixStream>>>,
     stop: Arc<AtomicBool>,
 }
@@ -328,10 +329,17 @@ impl WireProxy {
         let _ = fs::remove_file(&api_path);
         let _ = fs::remove_file(&client_path);
         let latency = Arc::new(Mutex::new(Duration::ZERO));
+        let api_latency = Arc::new(Mutex::new(Duration::ZERO));
         let data_streams = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
 
-        spawn_proxy_listener(&api_path, real_api.to_path_buf(), None, None, stop.clone());
+        spawn_proxy_listener(
+            &api_path,
+            real_api.to_path_buf(),
+            Some(api_latency.clone()),
+            None,
+            stop.clone(),
+        );
         spawn_proxy_listener(
             &client_path,
             real_client.to_path_buf(),
@@ -342,6 +350,7 @@ impl WireProxy {
         WireProxy {
             api_path,
             latency,
+            api_latency,
             data_streams,
             stop,
         }
@@ -353,6 +362,14 @@ impl WireProxy {
 
     fn set_latency(&self, latency: Duration) {
         *self.latency.lock().unwrap() = latency;
+    }
+
+    /// Injects latency on the control (API) plane — the path `layout_export`,
+    /// subscriptions, and structural mutations travel. Simulates SSH RTT on the
+    /// control socket (the real `herdr mirror <host>` transport).
+    #[allow(dead_code)]
+    fn set_api_latency(&self, latency: Duration) {
+        *self.api_latency.lock().unwrap() = latency;
     }
 
     /// Forcibly closes every live data-plane connection, simulating a transient
@@ -2454,6 +2471,125 @@ fn search_and_selection_are_local() {
 // (A minimal smoke test alongside the full acceptance suite above, which also
 // runs by default; the sole `#[ignore]` is the H3 copy-mode gate.)
 // ===========================================================================
+
+/// Regression guard (#fix-keyboard-input-drops): an IDLE mirror must not
+/// busy-redraw. A resize/redraw feedback loop (draw -> forward_resize -> server
+/// echoes size -> mirror data -> redraw -> ...) would emit a continuous stream of
+/// terminal output with no input, flooding the link and starving stdin — a
+/// mechanism behind "characters dropped / scrollback laggy", worst over SSH.
+#[test]
+fn idle_mirror_does_not_busy_redraw() {
+    let _guard = mirror_tui_test_guard();
+    let sess = Session::new();
+    let _server = spawn_server(&sess);
+    let _p1 = create_workspace_root_pane(&sess.api_socket, "idle");
+    let mirror = spawn_mirror_tui(&sess, 120, 40);
+    wait_ready(&mirror);
+    // Let the initial paint settle.
+    thread::sleep(Duration::from_millis(500));
+
+    let before = mirror.output().len();
+    thread::sleep(Duration::from_secs(2));
+    let after = mirror.output().len();
+    let grew = after - before;
+    // A single full 120x40 repaint is well under ~40 KiB. With no input and no
+    // pane output, an idle mirror should emit at most a couple of frames. Many
+    // frames/sec (hundreds of KiB) means a busy redraw loop.
+    assert!(
+        grew < 40_000,
+        "idle mirror emitted {grew} bytes in 2s with no input — busy redraw loop"
+    );
+
+    cleanup_test_base(&sess.base);
+}
+
+/// Regression guard (#fix-keyboard-input-drops): keystrokes must all reach the
+/// focused pane even while a burst of structural control events fires under a
+/// realistic control-plane RTT. Each structural change makes the mirror
+/// `reproject()`, which does a blocking `layout.export` round-trip on the event
+/// loop; a burst of them (a split emits pane.created + layout.updated +
+/// pane.focused) must not stall or drop input. The mirror coalesces a control-event
+/// burst into a single reprojection so the loop stays responsive; this test drives
+/// continuous focus churn over a 200 ms RTT while typing and asserts every byte is
+/// delivered, in order, well within a generous bound.
+#[test]
+fn input_survives_structural_bursts_over_rtt() {
+    let _guard = mirror_tui_test_guard();
+    let sess = Session::new();
+    let _server = spawn_server(&sess);
+    let p1 = create_workspace_root_pane(&sess.api_socket, "rttinput");
+    let p2 = split_pane(&sess.api_socket, &p1, "horizontal");
+    pane_focus(&sess.api_socket, &p1);
+    setup_echo_pane(&sess.api_socket, &p1, false, false, "echoready_rttinput");
+
+    let proxy = WireProxy::start(
+        &sess.base.join("proxy"),
+        &sess.api_socket,
+        &sess.client_socket,
+    );
+    let mut mirror = spawn_mirror_tui_via(&proxy, 120, 40, &sess.config_home);
+    wait_client_shows(&mirror, 120, 40, "echoready_rttinput");
+
+    // Observe the server's p1 PTY directly (real socket, no injected latency).
+    let (mut p1_sub, _base) = subscribe_mirror(&sess.client_socket, &p1, false);
+    drain_mirror(&mut p1_sub, Duration::from_millis(500));
+
+    // Realistic SSH control-plane RTT (the path layout.export/subscriptions take).
+    proxy.set_api_latency(Duration::from_millis(200));
+
+    // Continuously churn focus between the two panes -> a steady stream of
+    // structural (pane.focused) control events while typing.
+    let api_socket = sess.api_socket.clone();
+    let panes = [p1.clone(), p2.clone()];
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_bg = stop.clone();
+    let bg = thread::spawn(move || {
+        let mut i = 0;
+        while !stop_bg.load(Ordering::SeqCst) {
+            pane_focus(&api_socket, &panes[i % 2]);
+            i += 1;
+            thread::sleep(Duration::from_millis(15));
+        }
+    });
+
+    let typed = b"abcdefghij";
+    for &b in typed {
+        mirror.write_input(&[b]);
+        thread::sleep(Duration::from_millis(30));
+    }
+
+    let mut echoed = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        echoed.extend_from_slice(&collect_mirror_output(
+            &mut p1_sub,
+            Duration::from_millis(300),
+        ));
+        let seen: Vec<u8> = echoed
+            .iter()
+            .copied()
+            .filter(|b| typed.contains(b))
+            .collect();
+        if seen == typed {
+            break;
+        }
+    }
+    stop.store(true, Ordering::SeqCst);
+    let _ = bg.join();
+
+    let seen: Vec<u8> = echoed
+        .iter()
+        .copied()
+        .filter(|b| typed.contains(b))
+        .collect();
+    assert_eq!(
+        String::from_utf8_lossy(&seen),
+        String::from_utf8_lossy(typed),
+        "server must receive every typed char even under structural-event RTT load"
+    );
+
+    cleanup_test_base(&sess.base);
+}
 
 #[test]
 fn harness_starts_server_and_creates_pane() {

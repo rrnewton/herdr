@@ -780,14 +780,52 @@ impl MirrorApp {
 
     // --- control plane --------------------------------------------------------
 
+    /// Handles a control event and coalesces any immediately-pending sibling
+    /// control events into the same reprojection.
+    ///
+    /// Each structural change triggers a [`Self::reproject`], which does a blocking
+    /// `layout.export` round-trip per tab on the event loop — a full control-plane
+    /// RTT the loop cannot service input during. A single user action typically
+    /// emits a *burst* of control events (e.g. a split → `pane.created` +
+    /// `layout.updated` + `pane.focused`), so applying them all first and
+    /// reprojecting **once** collapses N blocking round-trips into one, keeping the
+    /// loop responsive to keystrokes during structural activity. Non-control events
+    /// (stdin, mirror data) break the drain and are pushed back so input is never
+    /// starved. Mirrors the burst-coalescing in [`Self::handle_mirror`].
     fn handle_control_event(
+        &mut self,
+        pump: &mut ClientEventPump,
+        envelope: crate::api::schema::EventEnvelope,
+    ) {
+        let mut structural = self.apply_control_event(pump, envelope);
+        while let Some(event) = pump.try_next() {
+            match event {
+                ClientLoopEvent::ControlEvent(envelope) => {
+                    structural |= self.apply_control_event(pump, *envelope);
+                }
+                other => {
+                    pump.push_front(other);
+                    break;
+                }
+            }
+        }
+        if structural {
+            self.reproject();
+        }
+        self.needs_redraw = true;
+    }
+
+    /// Applies one control event to the replica and reconciles data connections,
+    /// returning whether it changed session structure (and thus needs a
+    /// reprojection). Does not reproject or draw — the caller batches those.
+    fn apply_control_event(
         &mut self,
         pump: &ClientEventPump,
         envelope: crate::api::schema::EventEnvelope,
-    ) {
+    ) -> bool {
         let changes = self.replica.apply_event(envelope);
         if changes.is_empty() {
-            return;
+            return false;
         }
         let mut structural = false;
         for change in changes {
@@ -825,10 +863,7 @@ impl MirrorApp {
                 } => self.show_toast(kind, title, context),
             }
         }
-        if structural {
-            self.reproject();
-        }
-        self.needs_redraw = true;
+        structural
     }
 
     /// Projects a server notification onto `AppState.toast` and arms the local
