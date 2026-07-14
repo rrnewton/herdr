@@ -870,6 +870,14 @@ pub(crate) enum CopyModeSearchDirection {
 pub(crate) struct CopyModeSearchPrompt {
     pub direction: CopyModeSearchDirection,
     pub query: String,
+    /// Incremental (tmux/readline style) prompt opened with Ctrl-R/Ctrl-S: the
+    /// query is searched live as the user types and Ctrl-R/Ctrl-S step between
+    /// matches. `false` is the vi-style `/`,`?` prompt that submits on Enter.
+    pub incremental: bool,
+    /// Cursor position captured when the prompt opened. Used as the fixed origin
+    /// for incremental previews so matches don't drift as the query grows, and
+    /// to restore the cursor when an incremental search is cancelled.
+    pub origin: Option<crate::pane::TerminalTextPoint>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

@@ -74,18 +74,40 @@ pub(super) fn render_copy_mode_overlay(app: &AppState, frame: &mut Frame, area: 
         return;
     };
     let line = if let Some(prompt) = copy_mode.search.prompt.as_ref() {
-        let marker = match prompt.direction {
-            crate::app::state::CopyModeSearchDirection::Forward => "/",
-            crate::app::state::CopyModeSearchDirection::Backward => "?",
-        };
-        Line::from(vec![
-            Span::styled(" COPY ", mode_style),
-            Span::raw(" "),
-            Span::styled(marker, key),
-            Span::styled(prompt.query.clone(), Style::default().fg(app.palette.text)),
-            Span::styled("█", key),
-            Span::styled("  enter search  esc cancel", dim),
-        ])
+        if prompt.incremental {
+            let marker = match prompt.direction {
+                crate::app::state::CopyModeSearchDirection::Forward => "fwd-search: ",
+                crate::app::state::CopyModeSearchDirection::Backward => "rev-search: ",
+            };
+            let count = copy_mode
+                .search
+                .current
+                .map(|current| format!(" [{}/{}]", current + 1, copy_mode.search.matches.len()))
+                .or_else(|| (!prompt.query.is_empty()).then(|| " [0/0]".to_string()))
+                .unwrap_or_default();
+            Line::from(vec![
+                Span::styled(" COPY ", mode_style),
+                Span::raw(" "),
+                Span::styled(marker, key),
+                Span::styled(prompt.query.clone(), Style::default().fg(app.palette.text)),
+                Span::styled("█", key),
+                Span::styled(count, dim),
+                Span::styled("  C-r/C-s next  enter accept  esc cancel", dim),
+            ])
+        } else {
+            let marker = match prompt.direction {
+                crate::app::state::CopyModeSearchDirection::Forward => "/",
+                crate::app::state::CopyModeSearchDirection::Backward => "?",
+            };
+            Line::from(vec![
+                Span::styled(" COPY ", mode_style),
+                Span::raw(" "),
+                Span::styled(marker, key),
+                Span::styled(prompt.query.clone(), Style::default().fg(app.palette.text)),
+                Span::styled("█", key),
+                Span::styled("  enter search  esc cancel", dim),
+            ])
+        }
     } else {
         let select = if copy_mode.selection.is_some() {
             "selecting"
@@ -109,7 +131,7 @@ pub(super) fn render_copy_mode_overlay(app: &AppState, frame: &mut Frame, area: 
             Span::raw(" "),
             Span::styled("h/j/k/l w/b/e { }", key),
             Span::styled(" move  ", dim),
-            Span::styled("/ ?", key),
+            Span::styled("/ ? C-r/C-s", key),
             Span::styled(" search  ", dim),
             Span::styled("n/N", key),
             Span::styled(format!(" repeat{match_status}  "), dim),

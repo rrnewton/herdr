@@ -4,6 +4,7 @@
 
 ### Added
 - Copy mode now supports literal smart-case search with `/` and `?`, repeating with `n` and `N`, match highlighting, and tmux-style cross-line `w`/`b`/`e` word motions. (#1230)
+- Copy mode now supports tmux-style incremental search with `ctrl+r` (reverse) and `ctrl+s` (forward): matches preview and highlight as you type, `ctrl+r`/`ctrl+s` step between matches, Enter accepts, and Esc cancels back to the starting position.
 - Added maki detection with idle, working, and blocked screen states. (#1301, thanks @tontinton)
 
 ### Fixed

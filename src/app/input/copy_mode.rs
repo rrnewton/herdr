@@ -11,6 +11,30 @@ use crate::{
     terminal::TerminalRuntimeRegistry,
 };
 
+/// Deferred action produced by the copy-mode search prompt handler so the
+/// `prompt`/`copy_mode` borrow can be released before calling `&mut self`
+/// search helpers.
+enum PromptFollowUp {
+    None,
+    RunIncremental,
+    CancelIncremental,
+    Step(CopyModeSearchDirection),
+    Submit(String, CopyModeSearchDirection),
+    ConfirmIncremental(String, CopyModeSearchDirection),
+}
+
+impl PromptFollowUp {
+    /// Follow-up after a query edit: re-search live in incremental mode, or do
+    /// nothing for the vi-style submit-on-Enter prompt.
+    fn edit(incremental: bool) -> Self {
+        if incremental {
+            Self::RunIncremental
+        } else {
+            Self::None
+        }
+    }
+}
+
 impl App {
     pub(crate) fn handle_copy_mode_key(&mut self, key: TerminalKey) {
         if key.kind == KeyEventKind::Release {
@@ -170,6 +194,10 @@ impl AppState {
             (KeyCode::Char('d'), mods) if mods.contains(KeyModifiers::CONTROL) => {
                 self.scroll_copy_mode_page(terminal_runtimes, 1, true)
             }
+            (KeyCode::Char('r'), mods) if mods.contains(KeyModifiers::CONTROL) => self
+                .open_copy_mode_search(terminal_runtimes, CopyModeSearchDirection::Backward, true),
+            (KeyCode::Char('s'), mods) if mods.contains(KeyModifiers::CONTROL) => self
+                .open_copy_mode_search(terminal_runtimes, CopyModeSearchDirection::Forward, true),
             _ => {}
         }
 
@@ -190,8 +218,16 @@ impl AppState {
             '0' => self.copy_mode_line_edge(terminal_runtimes, false),
             '$' => self.copy_mode_line_edge(terminal_runtimes, true),
             '^' => self.copy_mode_first_non_blank(terminal_runtimes),
-            '/' => self.open_copy_mode_search(CopyModeSearchDirection::Forward),
-            '?' => self.open_copy_mode_search(CopyModeSearchDirection::Backward),
+            '/' => self.open_copy_mode_search(
+                terminal_runtimes,
+                CopyModeSearchDirection::Forward,
+                false,
+            ),
+            '?' => self.open_copy_mode_search(
+                terminal_runtimes,
+                CopyModeSearchDirection::Backward,
+                false,
+            ),
             'n' => self.repeat_copy_mode_search(terminal_runtimes, false),
             'N' => self.repeat_copy_mode_search(terminal_runtimes, true),
             'w' => self.copy_mode_word_motion(terminal_runtimes, WordMotion::NextStart),
@@ -208,45 +244,247 @@ impl AppState {
         terminal_runtimes: &TerminalRuntimeRegistry,
         key: TerminalKey,
     ) -> bool {
-        let Some(copy_mode) = self.copy_mode.as_mut() else {
-            return false;
-        };
-        let Some(prompt) = copy_mode.search.prompt.as_mut() else {
-            return false;
-        };
-        match key.code {
-            KeyCode::Esc => {
-                copy_mode.search.prompt = None;
-            }
-            KeyCode::Enter => {
-                let direction = prompt.direction;
-                let query = std::mem::take(&mut prompt.query);
-                copy_mode.search.prompt = None;
-                self.submit_copy_mode_search(terminal_runtimes, query, direction, false);
-            }
-            KeyCode::Backspace => {
-                prompt.query.pop();
-            }
-            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                prompt.query.clear();
-            }
-            _ => {
-                if let Some(ch) = copy_mode_command_char(key) {
-                    prompt.query.push(ch);
+        // Decide the follow-up action while the `prompt` borrow is alive, then
+        // release it before invoking any `&mut self` search helper.
+        let after = {
+            let Some(copy_mode) = self.copy_mode.as_mut() else {
+                return false;
+            };
+            let Some(prompt) = copy_mode.search.prompt.as_mut() else {
+                return false;
+            };
+            let incremental = prompt.incremental;
+            match key.code {
+                KeyCode::Esc => {
+                    if incremental {
+                        PromptFollowUp::CancelIncremental
+                    } else {
+                        copy_mode.search.prompt = None;
+                        PromptFollowUp::None
+                    }
                 }
+                KeyCode::Enter => {
+                    let direction = prompt.direction;
+                    let query = std::mem::take(&mut prompt.query);
+                    copy_mode.search.prompt = None;
+                    if incremental {
+                        PromptFollowUp::ConfirmIncremental(query, direction)
+                    } else {
+                        PromptFollowUp::Submit(query, direction)
+                    }
+                }
+                KeyCode::Backspace => {
+                    prompt.query.pop();
+                    PromptFollowUp::edit(incremental)
+                }
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    prompt.query.clear();
+                    PromptFollowUp::edit(incremental)
+                }
+                KeyCode::Char('r')
+                    if incremental && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    PromptFollowUp::Step(CopyModeSearchDirection::Backward)
+                }
+                KeyCode::Char('s')
+                    if incremental && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    PromptFollowUp::Step(CopyModeSearchDirection::Forward)
+                }
+                _ => {
+                    if let Some(ch) = copy_mode_command_char(key) {
+                        prompt.query.push(ch);
+                        PromptFollowUp::edit(incremental)
+                    } else {
+                        PromptFollowUp::None
+                    }
+                }
+            }
+        };
+        match after {
+            PromptFollowUp::None => {}
+            PromptFollowUp::RunIncremental => {
+                self.run_incremental_copy_mode_search(terminal_runtimes)
+            }
+            PromptFollowUp::CancelIncremental => self.cancel_incremental_search(terminal_runtimes),
+            PromptFollowUp::Step(direction) => {
+                self.step_incremental_search(terminal_runtimes, direction)
+            }
+            PromptFollowUp::Submit(query, direction) => {
+                self.submit_copy_mode_search(terminal_runtimes, query, direction, false)
+            }
+            PromptFollowUp::ConfirmIncremental(query, direction) => {
+                self.confirm_incremental_search(query, direction)
             }
         }
         true
     }
 
-    fn open_copy_mode_search(&mut self, direction: CopyModeSearchDirection) {
+    fn open_copy_mode_search(
+        &mut self,
+        terminal_runtimes: &TerminalRuntimeRegistry,
+        direction: CopyModeSearchDirection,
+        incremental: bool,
+    ) {
+        let origin = self.copy_mode_cursor_point(terminal_runtimes);
         let Some(copy_mode) = self.copy_mode.as_mut() else {
             return;
         };
         copy_mode.search.prompt = Some(CopyModeSearchPrompt {
             direction,
             query: String::new(),
+            incremental,
+            origin,
         });
+    }
+
+    /// Absolute text point of the copy-mode cursor in the focused pane's buffer.
+    fn copy_mode_cursor_point(
+        &self,
+        terminal_runtimes: &TerminalRuntimeRegistry,
+    ) -> Option<crate::pane::TerminalTextPoint> {
+        let copy_mode = self.copy_mode.as_ref()?;
+        let ws_idx = self.active?;
+        let runtime =
+            self.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, copy_mode.pane_id)?;
+        let metrics = runtime.scroll_metrics()?;
+        Some(crate::pane::TerminalTextPoint {
+            row: viewport_top_row(metrics).saturating_add(u32::from(copy_mode.cursor_row)),
+            col: copy_mode.cursor_col,
+        })
+    }
+
+    /// Re-run the incremental search from the prompt's fixed origin and move the
+    /// viewport/cursor to the nearest match so results preview as the user types.
+    pub(crate) fn run_incremental_copy_mode_search(
+        &mut self,
+        terminal_runtimes: &TerminalRuntimeRegistry,
+    ) {
+        let Some((query, direction, origin)) = self.copy_mode.as_ref().and_then(|copy_mode| {
+            copy_mode
+                .search
+                .prompt
+                .as_ref()
+                .map(|prompt| (prompt.query.clone(), prompt.direction, prompt.origin))
+        }) else {
+            return;
+        };
+        if query.is_empty() {
+            if let Some(copy_mode) = self.copy_mode.as_mut() {
+                copy_mode.search.query.clear();
+                copy_mode.search.matches.clear();
+                copy_mode.search.current = None;
+            }
+            return;
+        }
+        let Some(origin) = origin.or_else(|| self.copy_mode_cursor_point(terminal_runtimes)) else {
+            return;
+        };
+        let Some(ws_idx) = self.active else {
+            return;
+        };
+        let Some(pane_id) = self.copy_mode.as_ref().map(|copy_mode| copy_mode.pane_id) else {
+            return;
+        };
+        let Some(runtime) = self.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, pane_id)
+        else {
+            return;
+        };
+        let matches = runtime.search_text_matches(&query, query.chars().any(char::is_uppercase));
+        let current = search_match_index(&matches, direction, origin, None);
+
+        if let Some(copy_mode) = self.copy_mode.as_mut() {
+            copy_mode.search.query = query;
+            copy_mode.search.direction = Some(direction);
+            copy_mode.search.matches = matches;
+            copy_mode.search.current = current;
+        }
+
+        if let Some(target) = current.and_then(|index| {
+            self.copy_mode
+                .as_ref()
+                .and_then(|copy_mode| copy_mode.search.matches.get(index).copied())
+        }) {
+            self.move_copy_cursor_to_absolute(terminal_runtimes, target.start, true);
+        }
+    }
+
+    /// Advance to the next/previous match while an incremental prompt is open
+    /// (Ctrl-R = backward, Ctrl-S = forward). Reuses the last committed query if
+    /// the prompt is still empty, mirroring readline's repeat-last-search.
+    fn step_incremental_search(
+        &mut self,
+        terminal_runtimes: &TerminalRuntimeRegistry,
+        direction: CopyModeSearchDirection,
+    ) {
+        let query = self
+            .copy_mode
+            .as_ref()
+            .map(|copy_mode| {
+                let prompt_query = copy_mode
+                    .search
+                    .prompt
+                    .as_ref()
+                    .map(|prompt| prompt.query.clone())
+                    .unwrap_or_default();
+                if prompt_query.is_empty() {
+                    copy_mode.search.query.clone()
+                } else {
+                    prompt_query
+                }
+            })
+            .unwrap_or_default();
+        if query.is_empty() {
+            return;
+        }
+        if let Some(copy_mode) = self.copy_mode.as_mut() {
+            copy_mode.search.direction = Some(direction);
+            if let Some(prompt) = copy_mode.search.prompt.as_mut() {
+                if prompt.query.is_empty() {
+                    prompt.query = query.clone();
+                }
+                prompt.direction = direction;
+            }
+        }
+        self.submit_copy_mode_search(terminal_runtimes, query, direction, true);
+    }
+
+    /// Cancel an incremental search: clear the preview and return the cursor to
+    /// where the search started.
+    fn cancel_incremental_search(&mut self, terminal_runtimes: &TerminalRuntimeRegistry) {
+        let origin = self.copy_mode.as_ref().and_then(|copy_mode| {
+            copy_mode
+                .search
+                .prompt
+                .as_ref()
+                .and_then(|prompt| prompt.origin)
+        });
+        if let Some(copy_mode) = self.copy_mode.as_mut() {
+            let geometry = copy_mode.search.geometry;
+            copy_mode.search = crate::app::state::CopyModeSearchState {
+                geometry,
+                ..Default::default()
+            };
+        }
+        if let Some(origin) = origin {
+            self.move_copy_cursor_to_absolute(terminal_runtimes, origin, true);
+        }
+    }
+
+    /// Commit an incremental search on Enter. The matches/cursor were already
+    /// applied live, so this just retains the committed query/direction (so
+    /// `n`/`N` keep working) or clears an empty query.
+    fn confirm_incremental_search(&mut self, query: String, direction: CopyModeSearchDirection) {
+        let Some(copy_mode) = self.copy_mode.as_mut() else {
+            return;
+        };
+        if query.is_empty() {
+            copy_mode.search.matches.clear();
+            copy_mode.search.current = None;
+            return;
+        }
+        copy_mode.search.query = query;
+        copy_mode.search.direction = Some(direction);
     }
 
     fn repeat_copy_mode_search(
@@ -1611,6 +1849,209 @@ mod tests {
         app.handle_copy_mode_key(TerminalKey::new(KeyCode::Esc, KeyModifiers::empty()));
         assert_eq!(app.state.mode, Mode::Terminal);
         assert!(app.state.copy_mode.is_none());
+    }
+
+    fn ctrl(ch: char) -> TerminalKey {
+        TerminalKey::new(KeyCode::Char(ch), KeyModifiers::CONTROL)
+    }
+
+    fn type_query(app: &mut App, query: &str) {
+        for ch in query.chars() {
+            app.handle_copy_mode_key(TerminalKey::new(KeyCode::Char(ch), KeyModifiers::empty()));
+        }
+    }
+
+    #[tokio::test]
+    async fn copy_mode_ctrl_r_opens_incremental_reverse_search() {
+        let (mut app, _) = app_with_copy_screen(b"alpha needle\r\n");
+        app.state.enter_copy_mode(&app.terminal_runtimes);
+
+        app.handle_copy_mode_key(ctrl('r'));
+
+        let prompt = app
+            .state
+            .copy_mode
+            .as_ref()
+            .and_then(|copy_mode| copy_mode.search.prompt.as_ref())
+            .expect("incremental search prompt");
+        assert_eq!(prompt.direction, CopyModeSearchDirection::Backward);
+        assert!(prompt.incremental);
+        assert_eq!(app.state.mode, Mode::Copy);
+    }
+
+    #[tokio::test]
+    async fn copy_mode_ctrl_s_opens_incremental_forward_search() {
+        let (mut app, _) = app_with_copy_screen(b"alpha needle\r\n");
+        app.state.enter_copy_mode(&app.terminal_runtimes);
+
+        app.handle_copy_mode_key(ctrl('s'));
+
+        let prompt = app
+            .state
+            .copy_mode
+            .as_ref()
+            .and_then(|copy_mode| copy_mode.search.prompt.as_ref())
+            .expect("incremental search prompt");
+        assert_eq!(prompt.direction, CopyModeSearchDirection::Forward);
+        assert!(prompt.incremental);
+    }
+
+    #[tokio::test]
+    async fn copy_mode_incremental_search_highlights_while_typing() {
+        let (mut app, _) = app_with_copy_screen(b"alpha needle\r\nbeta needle\r\ngamma needle\r\n");
+        app.state.enter_copy_mode(&app.terminal_runtimes);
+
+        app.handle_copy_mode_key(ctrl('s'));
+        type_query(&mut app, "needle");
+
+        // Matches populate live (before Enter) so highlights render while typing.
+        let copy_mode = app.state.copy_mode.as_ref().expect("copy mode");
+        assert!(copy_mode.search.prompt.is_some());
+        assert_eq!(copy_mode.search.matches.len(), 3);
+        assert!(copy_mode.search.current.is_some());
+    }
+
+    #[tokio::test]
+    async fn copy_mode_incremental_ctrl_r_ctrl_s_cycle_matches() {
+        let (mut app, _) = app_with_copy_screen(b"alpha needle\r\nbeta needle\r\ngamma needle\r\n");
+        app.state.enter_copy_mode(&app.terminal_runtimes);
+        if let Some(copy_mode) = app.state.copy_mode.as_mut() {
+            copy_mode.cursor_row = 0;
+            copy_mode.cursor_col = 0;
+        }
+
+        app.handle_copy_mode_key(ctrl('s'));
+        type_query(&mut app, "needle");
+        assert_eq!(
+            app.state
+                .copy_mode
+                .as_ref()
+                .expect("copy mode")
+                .search
+                .current,
+            Some(0)
+        );
+
+        app.handle_copy_mode_key(ctrl('s'));
+        assert_eq!(
+            app.state
+                .copy_mode
+                .as_ref()
+                .expect("copy mode")
+                .search
+                .current,
+            Some(1)
+        );
+
+        app.handle_copy_mode_key(ctrl('s'));
+        assert_eq!(
+            app.state
+                .copy_mode
+                .as_ref()
+                .expect("copy mode")
+                .search
+                .current,
+            Some(2)
+        );
+
+        app.handle_copy_mode_key(ctrl('r'));
+        assert_eq!(
+            app.state
+                .copy_mode
+                .as_ref()
+                .expect("copy mode")
+                .search
+                .current,
+            Some(1)
+        );
+
+        // Prompt stays open throughout cycling.
+        assert!(app
+            .state
+            .copy_mode
+            .as_ref()
+            .expect("copy mode")
+            .search
+            .prompt
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn copy_mode_incremental_escape_cancels_and_restores_origin() {
+        let (mut app, pane_id) = app_with_copy_screen(b"alpha needle\r\nbeta needle\r\ngamma\r\n");
+        app.state.enter_copy_mode(&app.terminal_runtimes);
+        if let Some(copy_mode) = app.state.copy_mode.as_mut() {
+            copy_mode.cursor_row = 2;
+            copy_mode.cursor_col = 0;
+        }
+        let before = (
+            copy_mode_viewport_top_row(&app, pane_id)
+                + usize::from(app.state.copy_mode.as_ref().expect("copy mode").cursor_row),
+            app.state.copy_mode.as_ref().expect("copy mode").cursor_col,
+        );
+
+        app.handle_copy_mode_key(ctrl('r'));
+        type_query(&mut app, "needle");
+        // Preview jumped the cursor onto a match.
+        assert!(app
+            .state
+            .copy_mode
+            .as_ref()
+            .expect("copy mode")
+            .search
+            .current
+            .is_some());
+
+        app.handle_copy_mode_key(TerminalKey::new(KeyCode::Esc, KeyModifiers::empty()));
+
+        let search = &app.state.copy_mode.as_ref().expect("copy mode").search;
+        assert!(search.prompt.is_none());
+        assert!(search.query.is_empty());
+        assert!(search.matches.is_empty());
+        assert!(search.current.is_none());
+        assert_eq!(app.state.mode, Mode::Copy);
+
+        let after = (
+            copy_mode_viewport_top_row(&app, pane_id)
+                + usize::from(app.state.copy_mode.as_ref().expect("copy mode").cursor_row),
+            app.state.copy_mode.as_ref().expect("copy mode").cursor_col,
+        );
+        assert_eq!(after, before);
+    }
+
+    #[tokio::test]
+    async fn copy_mode_incremental_enter_confirms_and_allows_repeat() {
+        let (mut app, pane_id) = app_with_copy_screen(b"alpha needle\r\nbeta needle\r\ngamma\r\n");
+        app.state.enter_copy_mode(&app.terminal_runtimes);
+        if let Some(copy_mode) = app.state.copy_mode.as_mut() {
+            copy_mode.cursor_row = 0;
+            copy_mode.cursor_col = 0;
+        }
+
+        app.handle_copy_mode_key(ctrl('s'));
+        type_query(&mut app, "needle");
+        app.handle_copy_mode_key(TerminalKey::new(KeyCode::Enter, KeyModifiers::empty()));
+
+        let copy_mode = app.state.copy_mode.as_ref().expect("copy mode");
+        assert!(copy_mode.search.prompt.is_none());
+        assert_eq!(copy_mode.search.query, "needle");
+        assert_eq!(copy_mode.search.current, Some(0));
+        assert_eq!(
+            copy_mode_viewport_top_row(&app, pane_id) + usize::from(copy_mode.cursor_row),
+            0
+        );
+
+        // The committed query keeps vi-style `n` repeat working after confirm.
+        app.handle_copy_mode_key(TerminalKey::new(KeyCode::Char('n'), KeyModifiers::empty()));
+        assert_eq!(
+            app.state
+                .copy_mode
+                .as_ref()
+                .expect("copy mode")
+                .search
+                .current,
+            Some(1)
+        );
     }
 
     #[tokio::test]

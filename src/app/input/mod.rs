@@ -156,17 +156,24 @@ impl App {
                 true
             }
             Mode::Copy => {
-                let Some(prompt) = self
-                    .state
-                    .copy_mode
-                    .as_mut()
-                    .and_then(|copy_mode| copy_mode.search.prompt.as_mut())
-                else {
-                    return false;
+                let incremental = {
+                    let Some(prompt) = self
+                        .state
+                        .copy_mode
+                        .as_mut()
+                        .and_then(|copy_mode| copy_mode.search.prompt.as_mut())
+                    else {
+                        return false;
+                    };
+                    prompt
+                        .query
+                        .extend(text.chars().filter(|ch| !ch.is_control()));
+                    prompt.incremental
                 };
-                prompt
-                    .query
-                    .extend(text.chars().filter(|ch| !ch.is_control()));
+                if incremental {
+                    self.state
+                        .run_incremental_copy_mode_search(&self.terminal_runtimes);
+                }
                 true
             }
             _ => false,
