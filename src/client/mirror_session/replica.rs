@@ -49,6 +49,16 @@ pub enum ReplicaChange {
     /// Workspace/tab tree metadata changed (labels, ordering, focus) with no
     /// direct data-plane impact.
     Structural,
+    /// The server raised a notification/toast (e.g. an agent finished). The mirror
+    /// driver projects this into `AppState.toast` and arms a local expiry timer;
+    /// it has no data-plane impact and does not persist in the replica structure.
+    NotificationShown {
+        kind: crate::api::schema::NotificationKind,
+        title: String,
+        context: String,
+        workspace_id: Option<String>,
+        pane_id: Option<String>,
+    },
 }
 
 /// A pure-data replica of the server's session structure.
@@ -286,6 +296,19 @@ impl SessionReplica {
                 self.layouts.insert(tab_id.clone(), layout);
                 vec![ReplicaChange::LayoutChanged { tab_id }]
             }
+            EventData::NotificationShown {
+                kind,
+                title,
+                context,
+                workspace_id,
+                pane_id,
+            } => vec![ReplicaChange::NotificationShown {
+                kind,
+                title,
+                context,
+                workspace_id,
+                pane_id,
+            }],
             // Output revisions carry no structural change; the data plane feeds
             // content directly into each terminal's mirror runtime.
             EventData::PaneOutputChanged { .. } => Vec::new(),
@@ -498,6 +521,8 @@ mod tests {
             active_tab_id: active_tab_id.into(),
             agent_status: AgentStatus::Unknown,
             branch: None,
+            git_ahead: None,
+            git_behind: None,
             worktree: None,
         }
     }
@@ -694,6 +719,34 @@ mod tests {
         assert_eq!(pane.agent_status, AgentStatus::Working);
         assert_eq!(pane.agent.as_deref(), Some("pi"));
         assert_eq!(pane.title.as_deref(), Some("building"));
+    }
+
+    #[test]
+    fn notification_shown_yields_notification_change() {
+        use crate::api::schema::NotificationKind;
+        let mut replica = SessionReplica::from_snapshot(snapshot());
+        let changes = replica.apply_event(envelope(
+            EventKind::NotificationShown,
+            EventData::NotificationShown {
+                kind: NotificationKind::Finished,
+                title: "pi finished".into(),
+                context: "workspace api".into(),
+                workspace_id: Some("ws1".into()),
+                pane_id: Some("pane1".into()),
+            },
+        ));
+        assert_eq!(
+            changes,
+            vec![ReplicaChange::NotificationShown {
+                kind: NotificationKind::Finished,
+                title: "pi finished".into(),
+                context: "workspace api".into(),
+                workspace_id: Some("ws1".into()),
+                pane_id: Some("pane1".into()),
+            }]
+        );
+        // Notifications are ephemeral; they don't mutate the replica structure.
+        assert_eq!(replica.panes.len(), 1);
     }
 
     #[test]

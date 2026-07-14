@@ -15,12 +15,12 @@ use std::collections::BTreeSet;
 use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 use ratatui::DefaultTerminal;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::api::client::ApiClientError;
 use crate::api::schema::{Method, PaneTarget};
@@ -62,6 +62,10 @@ pub(crate) struct MirrorApp {
     last_forwarded_pane_size: Option<(String, u16, u16)>,
     mouse_scroll_lines: usize,
     needs_redraw: bool,
+    /// When the currently-shown server toast should be cleared. The mirror has no
+    /// local toast pipeline, so it drives its own expiry off the 100ms client
+    /// timer, matching the server TUI's per-kind durations (`App::sync_toast_deadline`).
+    toast_deadline: Option<Instant>,
 }
 
 impl MirrorApp {
@@ -123,6 +127,7 @@ impl MirrorApp {
             last_forwarded_pane_size: None,
             mouse_scroll_lines,
             needs_redraw: true,
+            toast_deadline: None,
         })
     }
 
@@ -354,12 +359,37 @@ impl MirrorApp {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) -> Result<(), ClientError> {
+        // Mouse-path tracing (enable with `HERDR_LOG=herdr=debug`): every mouse
+        // event that reaches the mirror is logged with the pane it hit and the
+        // branch taken, so a "clicks do nothing" report can be traced to the exact
+        // point of loss (no pane hit? no terminal resolved? focus/forward taken?).
         let Some(info) = self.pane_info_at(mouse.column, mouse.row, true) else {
+            debug!(
+                kind = ?mouse.kind,
+                col = mouse.column,
+                row = mouse.row,
+                "mirror mouse: no pane at coords; routing to focused-reported"
+            );
             return self.forward_focused_reported_mouse(mouse);
         };
         let Some((pane_id, terminal_id)) = self.public_and_terminal_for_local_pane(info.id) else {
+            debug!(
+                kind = ?mouse.kind,
+                col = mouse.column,
+                row = mouse.row,
+                local_pane = ?info.id,
+                "mirror mouse: pane hit but no public/terminal mapping; dropping"
+            );
             return Ok(());
         };
+        debug!(
+            kind = ?mouse.kind,
+            col = mouse.column,
+            row = mouse.row,
+            %pane_id,
+            %terminal_id,
+            "mirror mouse: dispatching"
+        );
 
         if matches!(
             mouse.kind,
@@ -613,6 +643,10 @@ impl MirrorApp {
         // request per tick. The data-plane `set_focus` already no-ops on an
         // unchanged focus; this guard extends that to the control-plane mutation.
         if self.data.focused() == Some(terminal_id) {
+            debug!(
+                %terminal_id,
+                "mirror focus: already focused; skipping handoff"
+            );
             return;
         }
         if let Err(err) = self.data.set_focus(Some(terminal_id)) {
@@ -621,6 +655,7 @@ impl MirrorApp {
         let sink = JsonApiSink {
             control: &self.control,
         };
+        debug!(%pane_id, %terminal_id, "mirror focus: dispatching pane.focus to server");
         if let Err(err) = sink.dispatch(
             "tui.mirror.pane.focus",
             Method::PaneFocus(PaneTarget { pane_id }),
@@ -782,12 +817,61 @@ impl MirrorApp {
                 ReplicaChange::LayoutChanged { .. } | ReplicaChange::Structural => {
                     structural = true;
                 }
+                ReplicaChange::NotificationShown {
+                    kind,
+                    title,
+                    context,
+                    ..
+                } => self.show_toast(kind, title, context),
             }
         }
         if structural {
             self.reproject();
         }
         self.needs_redraw = true;
+    }
+
+    /// Projects a server notification onto `AppState.toast` and arms the local
+    /// expiry timer. The `workspace_id`/`pane_id` a pane-scoped notification
+    /// carries are not mapped to a local target (the mirror does not support
+    /// click-to-focus on a toast), so the toast is shown untargeted.
+    fn show_toast(
+        &mut self,
+        kind: crate::api::schema::NotificationKind,
+        title: String,
+        context: String,
+    ) {
+        use crate::api::schema::NotificationKind;
+        use crate::app::state::{ToastKind, ToastNotification};
+        let (toast_kind, duration) = match kind {
+            NotificationKind::NeedsAttention => (ToastKind::NeedsAttention, Duration::from_secs(8)),
+            NotificationKind::Finished => (ToastKind::Finished, Duration::from_secs(5)),
+            NotificationKind::UpdateInstalled => {
+                (ToastKind::UpdateInstalled, Duration::from_secs(3))
+            }
+        };
+        self.app.state.toast = Some(ToastNotification {
+            kind: toast_kind,
+            title,
+            context,
+            position: None,
+            target: None,
+        });
+        self.toast_deadline = Some(Instant::now() + duration);
+    }
+
+    /// Clears the shown toast once its deadline passes, driven by the client
+    /// timer. Mirrors the server TUI's toast expiry (`App::run`'s scheduled-task
+    /// loop), which the mirror otherwise lacks.
+    fn expire_toast(&mut self) {
+        if self
+            .toast_deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            self.toast_deadline = None;
+            self.app.state.toast = None;
+            self.needs_redraw = true;
+        }
     }
 
     /// Rebuilds the projected `AppState` from the current replica and re-syncs the
@@ -904,7 +988,10 @@ impl ClientLoopHandler for MirrorApp {
             ClientLoopEvent::ControlDisconnected => self.handle_control_disconnected(pump),
             // The mirror holds no untagged server connection; these can't occur.
             ClientLoopEvent::ServerMessage(_) | ClientLoopEvent::ServerDisconnected => {}
-            ClientLoopEvent::Timer => self.tick_animation(),
+            ClientLoopEvent::Timer => {
+                self.tick_animation();
+                self.expire_toast();
+            }
         }
 
         if self.state().should_quit || self.state().detach_requested {

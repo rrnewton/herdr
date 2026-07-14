@@ -412,6 +412,39 @@ fn event_envelope_round_trips() {
 }
 
 #[test]
+fn notification_shown_event_round_trips() {
+    let event = EventEnvelope {
+        event: EventKind::NotificationShown,
+        data: EventData::NotificationShown {
+            kind: crate::api::schema::NotificationKind::Finished,
+            title: "pi finished".into(),
+            context: "workspace api".into(),
+            workspace_id: Some("w_1".into()),
+            pane_id: Some("w_1-1".into()),
+        },
+    };
+    let json = serde_json::to_value(&event).unwrap();
+    assert_eq!(json["event"], "notification_shown");
+    assert_eq!(json["data"]["type"], "notification_shown");
+    assert_eq!(json["data"]["kind"], "finished");
+    let restored: EventEnvelope = serde_json::from_value(json).unwrap();
+    assert_eq!(restored, event);
+}
+
+#[test]
+fn notification_shown_subscription_parses() {
+    let json = r#"{"id":"sub_1","method":"events.subscribe","params":{"subscriptions":[{"type":"notification.shown"}]}}"#;
+    let request: Request = serde_json::from_str(json).unwrap();
+    let Method::EventsSubscribe(params) = request.method else {
+        panic!("wrong method parsed");
+    };
+    assert!(matches!(
+        params.subscriptions.as_slice(),
+        [Subscription::NotificationShown {}]
+    ));
+}
+
+#[test]
 fn subscribe_request_parses_parameterized_subscriptions() {
     let json = r#"
     {
@@ -598,6 +631,8 @@ fn worktree_request_and_response_round_trip() {
                 agent_status: AgentStatus::Unknown,
                 tokens: HashMap::new(),
                 branch: Some("worktree/api".into()),
+                git_ahead: Some(3),
+                git_behind: Some(0),
                 worktree: Some(WorkspaceWorktreeInfo {
                     repo_key: "/repo/herdr/.git".into(),
                     repo_name: "herdr".into(),
@@ -687,6 +722,8 @@ fn worktree_lifecycle_events_round_trip() {
         agent_status: AgentStatus::Unknown,
         tokens: HashMap::new(),
         branch: Some("worktree/api".into()),
+        git_ahead: None,
+        git_behind: None,
         worktree: Some(WorkspaceWorktreeInfo {
             repo_key: "/repo/herdr/.git".into(),
             repo_name: "herdr".into(),

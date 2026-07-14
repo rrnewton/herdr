@@ -680,7 +680,45 @@ impl App {
                 };
                 Instant::now() + duration
             });
+            // Forward a newly-raised toast onto the structural event feed so
+            // mirror clients (which have no local toast pipeline) can show the
+            // same notification. Clears are driven by each client's own expiry
+            // timer, so only emit when a toast appears/changes.
+            if let Some(toast) = self.state.toast.clone() {
+                self.emit_toast_event(&toast);
+            }
         }
+    }
+
+    /// Emits a [`crate::api::schema::EventKind::NotificationShown`] event mirroring
+    /// the current in-TUI toast, resolving the target pane's public id when the
+    /// toast is pane-scoped.
+    fn emit_toast_event(&mut self, toast: &crate::app::state::ToastNotification) {
+        use crate::api::schema::{EventData, EventEnvelope, EventKind, NotificationKind};
+        let kind = match toast.kind {
+            ToastKind::NeedsAttention => NotificationKind::NeedsAttention,
+            ToastKind::Finished => NotificationKind::Finished,
+            ToastKind::UpdateInstalled => NotificationKind::UpdateInstalled,
+        };
+        let (workspace_id, pane_id) = match &toast.target {
+            Some(target) => {
+                let pane_id = self
+                    .parse_workspace_id(&target.workspace_id)
+                    .and_then(|ws_idx| self.public_pane_id(ws_idx, target.pane_id));
+                (Some(target.workspace_id.clone()), pane_id)
+            }
+            None => (None, None),
+        };
+        self.emit_event(EventEnvelope {
+            event: EventKind::NotificationShown,
+            data: EventData::NotificationShown {
+                kind,
+                title: toast.title.clone(),
+                context: toast.context.clone(),
+                workspace_id,
+                pane_id,
+            },
+        });
     }
 
     pub(crate) fn emit_delayed_client_local_agent_notifications(
@@ -1872,6 +1910,52 @@ mod tests {
             crate::api::schema::EventData::LayoutUpdated { layout }
                 if layout.tab_id == tab_id && layout.panes.len() == 1
         ));
+    }
+
+    #[test]
+    fn toast_raise_emits_notification_shown_and_clear_does_not() {
+        let event_hub = crate::api::EventHub::default();
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            api_rx,
+            event_hub.clone(),
+        );
+
+        // Raising a toast forwards a notification.shown event and arms the deadline.
+        let previous_toast = app.state.toast.clone();
+        app.state.toast = Some(crate::app::state::ToastNotification {
+            kind: ToastKind::Finished,
+            title: "pi finished".into(),
+            context: "workspace api".into(),
+            position: None,
+            target: None,
+        });
+        app.sync_toast_deadline(previous_toast);
+        assert!(app.toast_deadline.is_some());
+
+        let events = event_hub.events_after(0);
+        let notification = events
+            .iter()
+            .find(|(_, event)| event.event == crate::api::schema::EventKind::NotificationShown)
+            .expect("notification.shown should be emitted");
+        assert!(matches!(
+            &notification.1.data,
+            crate::api::schema::EventData::NotificationShown { kind, title, .. }
+                if *kind == crate::api::schema::NotificationKind::Finished
+                    && title == "pi finished"
+        ));
+
+        // Clearing the toast is driven by each client's own expiry timer, so no
+        // further event is emitted on the None transition.
+        let seq = event_hub.current_sequence();
+        let previous_toast = app.state.toast.clone();
+        app.state.toast = None;
+        app.sync_toast_deadline(previous_toast);
+        assert!(app.toast_deadline.is_none());
+        assert!(event_hub.events_after(seq).is_empty());
     }
 
     #[test]

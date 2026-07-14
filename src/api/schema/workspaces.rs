@@ -59,6 +59,15 @@ pub struct WorkspaceInfo {
     /// server TUI without inspecting the filesystem themselves.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+    /// Commits the workspace branch is ahead of its upstream, when tracking one.
+    /// Paired with `git_behind` so clients (e.g. the mirror TUI) render the same
+    /// ahead/behind arrows as the server TUI sidebar. Both are `None` when the
+    /// branch has no upstream or the workspace is not a git checkout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_ahead: Option<usize>,
+    /// Commits the workspace branch is behind its upstream. See `git_ahead`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_behind: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<WorkspaceWorktreeInfo>,
 }

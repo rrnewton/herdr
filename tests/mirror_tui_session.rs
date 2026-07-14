@@ -1187,6 +1187,31 @@ fn grid_contains(proc: &PtyProc, cols: u16, rows: u16, needle: &str) -> bool {
     })
 }
 
+/// Finds the (row, col) — 0-based — of the first cell where `needle` begins in
+/// the rendered grid. Used to click precisely on a pane's on-screen content.
+fn grid_find_cell(grid: &TerminalGrid, needle: &str) -> Option<(usize, usize)> {
+    let needle: Vec<char> = needle.chars().collect();
+    for (r, row) in grid.cells.iter().enumerate() {
+        if row.len() < needle.len() {
+            continue;
+        }
+        for start in 0..=(row.len() - needle.len()) {
+            if row[start..start + needle.len()] == needle[..] {
+                return Some((r, start));
+            }
+        }
+    }
+    None
+}
+
+/// SGR mouse press+release for a left click at 0-based `(row, col)`. Terminals
+/// report SGR coordinates 1-based, so we add one.
+fn sgr_left_click(row: usize, col: usize) -> (Vec<u8>, Vec<u8>) {
+    let press = format!("\x1b[<0;{};{}M", col + 1, row + 1).into_bytes();
+    let release = format!("\x1b[<0;{};{}m", col + 1, row + 1).into_bytes();
+    (press, release)
+}
+
 /// The herdr prefix key (default `ctrl+b`).
 const PREFIX: &[u8] = b"\x02";
 
@@ -2092,6 +2117,104 @@ fn focus_change_hands_over_writable_pane() {
     assert!(
         !String::from_utf8_lossy(&p1_out).contains("herdr_handover_ok"),
         "old pane must stop receiving input after handover"
+    );
+
+    cleanup_test_base(&sess.base);
+}
+
+#[test]
+fn mouse_click_focuses_pane() {
+    let _guard = mirror_tui_test_guard();
+    let sess = Session::new();
+    let _server = spawn_server(&sess);
+    let p1 = create_workspace_root_pane(&sess.api_socket, "clickfocus");
+    let p2 = split_pane(&sess.api_socket, &p1, "horizontal");
+    pane_focus(&sess.api_socket, &p1);
+    // Drive a unique marker into p2 so we can locate it on the mirror screen.
+    pane_send_text(&sess.api_socket, &p2, "echo herdr_click_target");
+    let mut mirror = spawn_mirror_tui(&sess, 120, 40);
+    wait_ready(&mirror);
+    assert!(
+        grid_contains(&mirror, 120, 40, "herdr_click_target"),
+        "p2 marker must be visible before clicking"
+    );
+    // The mirror must actually ask the terminal for SGR mouse reporting (?1006h),
+    // otherwise no mouse bytes are ever emitted for clicks to act on.
+    assert!(
+        contains_subslice(&mirror.output(), b"\x1b[?1006h"),
+        "mirror must enable SGR mouse reporting on startup"
+    );
+
+    // Server focus starts on p1.
+    let focused_before = layout_export(&sess.api_socket)
+        .get("layout")
+        .and_then(|l| l.get("focused_pane_id"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    assert_eq!(
+        focused_before.as_deref(),
+        Some(p1.as_str()),
+        "p1 focused first"
+    );
+
+    // Click on p2's on-screen content — as a REAL terminal sends it: a flood of
+    // any-motion (mode 1003) reports ending at the target, then press+release,
+    // all coalesced into one stdin read.
+    let grid = mirror.capture_grid(120, 40, READY);
+    let (row, col) =
+        grid_find_cell(&grid, "herdr_click_target").expect("p2 marker located on the mirror grid");
+    let mut burst = Vec::new();
+    for step in 0..6usize {
+        let c = col.saturating_sub(6 - step);
+        // cb=35 → Moved (any-motion report).
+        burst.extend_from_slice(format!("\x1b[<35;{};{}M", c + 1, row + 1).as_bytes());
+    }
+    let (press, release) = sgr_left_click(row, col);
+    burst.extend_from_slice(&press);
+    burst.extend_from_slice(&release);
+    mirror.write_input(&burst);
+
+    // Acceptance 1: the click focuses p2 on the authoritative server.
+    let focused_p2 = wait_until(READY, Duration::from_millis(100), || {
+        layout_export(&sess.api_socket)
+            .get("layout")
+            .and_then(|l| l.get("focused_pane_id"))
+            .and_then(Value::as_str)
+            == Some(p2.as_str())
+    });
+    assert!(
+        focused_p2,
+        "clicking a pane must focus it; server focus never moved to p2"
+    );
+
+    // Acceptance 2: the writable handover follows the click — typed input now
+    // lands in the clicked pane (p2), not the previously focused one (p1).
+    let (mut p1_sub, _b) = subscribe_mirror(&sess.client_socket, &p1, false);
+    drain_mirror(&mut p1_sub, Duration::from_millis(500));
+    let (mut p2_sub, _b) = subscribe_mirror(&sess.client_socket, &p2, false);
+    drain_mirror(&mut p2_sub, Duration::from_millis(500));
+
+    mirror.write_input(b"echo herdr_after_click\r");
+
+    let p2_text = {
+        let deadline = Instant::now() + READY;
+        let mut acc = String::new();
+        while Instant::now() < deadline && !acc.contains("herdr_after_click") {
+            acc.push_str(&String::from_utf8_lossy(&collect_mirror_output(
+                &mut p2_sub,
+                Duration::from_millis(300),
+            )));
+        }
+        acc
+    };
+    assert!(
+        p2_text.contains("herdr_after_click"),
+        "after clicking p2, typed input must land in p2; got: {p2_text:?}"
+    );
+    let p1_out = collect_mirror_output(&mut p1_sub, Duration::from_millis(500));
+    assert!(
+        !String::from_utf8_lossy(&p1_out).contains("herdr_after_click"),
+        "old pane p1 must stop receiving input after the click"
     );
 
     cleanup_test_base(&sess.base);

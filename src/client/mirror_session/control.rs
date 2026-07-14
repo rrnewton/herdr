@@ -54,6 +54,7 @@ fn structural_subscriptions() -> Vec<Subscription> {
             agent_status: None,
         },
         Subscription::LayoutUpdated {},
+        Subscription::NotificationShown {},
     ]
 }
 

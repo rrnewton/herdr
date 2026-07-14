@@ -697,6 +697,13 @@ Layout event subscriptions include `layout.updated`. The event carries the
 updated `PaneLayoutSnapshot` for one tab. Clients that bootstrap with
 `session.snapshot` should replace the cached layout with the same
 `workspace_id` and `tab_id`.
+Notification event subscriptions include `notification.shown`. The event fires
+whenever Herdr raises an in-app notification/toast (e.g. an agent finishing or
+needing attention, an installed update, or a `notification.show` request). It
+carries the toast `kind` (`needs_attention`, `finished`, or `update_installed`),
+the `title` and `context` display text, and the optional `workspace_id`/`pane_id`
+the toast targets. Notifications are ephemeral; each client applies its own
+display duration.
 
 Worktree event subscriptions include `worktree.created`, `worktree.opened`, and `worktree.removed`. Worktree events describe Git checkout lifecycle. `worktree.created` includes the opened `workspace` and created `worktree`. `worktree.opened` includes the target `workspace`, opened `worktree`, and `already_open`. `worktree.removed` includes the `workspace_id`, removed `worktree`, and `forced`.
 

@@ -81,6 +81,8 @@ pub enum Subscription {
     PaneScrollChanged { pane_id: String },
     #[serde(rename = "layout.updated")]
     LayoutUpdated {},
+    #[serde(rename = "notification.shown")]
+    NotificationShown {},
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -216,6 +218,7 @@ pub enum EventKind {
     PaneAgentDetected,
     PaneAgentStatusChanged,
     LayoutUpdated,
+    NotificationShown,
 }
 
 impl EventKind {
@@ -246,6 +249,7 @@ impl EventKind {
             EventKind::PaneAgentDetected => "pane.agent_detected",
             EventKind::PaneAgentStatusChanged => "pane.agent_status_changed",
             EventKind::LayoutUpdated => "layout.updated",
+            EventKind::NotificationShown => "notification.shown",
         }
     }
 }
@@ -277,6 +281,7 @@ pub const KNOWN_EVENT_KINDS: &[EventKind] = &[
     EventKind::PaneAgentDetected,
     EventKind::PaneAgentStatusChanged,
     EventKind::LayoutUpdated,
+    EventKind::NotificationShown,
 ];
 
 pub const PLUGIN_HOOK_EVENT_KINDS: &[EventKind] = &[
@@ -412,6 +417,17 @@ pub struct PaneScrollChangedEvent {
     pub scroll: PaneScrollInfo,
 }
 
+/// The kind of a server notification/toast, the wire form of the TUI's
+/// `ToastKind`. Mirror clients render this to reproduce server toasts (e.g. an
+/// agent finishing) that would otherwise only be visible in the server TUI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationKind {
+    NeedsAttention,
+    Finished,
+    UpdateInstalled,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EventData {
@@ -537,5 +553,18 @@ pub enum EventData {
     },
     LayoutUpdated {
         layout: super::panes::PaneLayoutSnapshot,
+    },
+    /// A server-side notification/toast was raised (e.g. an agent finished or
+    /// needs attention). Carries the display text plus the optional pane/
+    /// workspace it targets, so a mirror client can show the same toast the
+    /// server TUI does.
+    NotificationShown {
+        kind: NotificationKind,
+        title: String,
+        context: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane_id: Option<String>,
     },
 }

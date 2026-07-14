@@ -16,6 +16,10 @@
 //! data-plane socket from it (`server::socket_paths::client_socket_path`), so a
 //! single forwarded pair is enough.
 //!
+//! The discovery and tunnel steps are two separate `ssh` invocations, so they
+//! share an SSH `ControlMaster` connection (see `CONTROL_PATH`) to authenticate
+//! once — otherwise a host with 2FA would prompt twice.
+//!
 //! This is purely a client-side launcher — it adds no server state or protocol.
 //! It relies on OpenSSH ≥ 6.7 Unix-domain-socket forwarding, so it is gated to
 //! Unix; Windows gets a stub that explains the limitation.
@@ -183,6 +187,13 @@ mod unix_impl {
     /// How long to wait for a forwarded socket to become connectable.
     const FORWARD_READY_TIMEOUT: Duration = Duration::from_secs(15);
 
+    /// Shared SSH `ControlPath` for connection multiplexing. The discovery SSH
+    /// opens a master connection here (`ControlMaster=auto`, kept alive briefly
+    /// with `ControlPersist`); the tunnel SSH reuses it, so the user only
+    /// authenticates (e.g. 2FA) once instead of per connection. `%h` expands to
+    /// the remote host so distinct hosts get distinct control sockets.
+    const CONTROL_PATH: &str = "/tmp/herdr-ssh-%h";
+
     pub(crate) fn run_mirror_command(args: &[String]) -> io::Result<i32> {
         let parsed = match parse_mirror_args(args) {
             Ok(parsed) => parsed,
@@ -270,8 +281,17 @@ mod unix_impl {
         remote_herdr: &str,
     ) -> io::Result<String> {
         eprintln!("herdr mirror: discovering herdr server on {host}…");
+        // Open a multiplexed master connection so the tunnel SSH can reuse it
+        // without a second authentication (avoids a double 2FA prompt). The
+        // master persists briefly after this command so the tunnel can attach.
         let output = Command::new("ssh")
             .args(ssh_args)
+            .arg("-o")
+            .arg("ControlMaster=auto")
+            .arg("-o")
+            .arg(format!("ControlPath={CONTROL_PATH}"))
+            .arg("-o")
+            .arg("ControlPersist=30")
             .arg(host)
             .arg(remote_herdr)
             .arg("status")
@@ -311,6 +331,10 @@ mod unix_impl {
     ) -> io::Result<Child> {
         Command::new("ssh")
             .args(ssh_args)
+            // Reuse the discovery SSH's master connection (same ControlPath) so
+            // the tunnel does not trigger a second authentication / 2FA prompt.
+            .arg("-o")
+            .arg(format!("ControlPath={CONTROL_PATH}"))
             .arg("-N")
             .arg("-o")
             .arg("ExitOnForwardFailure=yes")

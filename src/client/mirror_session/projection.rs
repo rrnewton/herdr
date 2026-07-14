@@ -133,6 +133,9 @@ pub(crate) fn rebuild_app_state(
         // mirror sidebar groups linked worktrees under one collapsible space,
         // exactly like the server TUI (`render_workspace_list`).
         workspace.worktree_space = projected_ws.worktree_space;
+        // Ahead/behind is server-authoritative like the branch subtitle; mirror it
+        // so the sidebar renders the same ↑/↓ arrows as the server TUI.
+        workspace.cached_git_ahead_behind = projected_ws.git_ahead_behind;
         workspaces.push(workspace);
     }
 
@@ -458,6 +461,7 @@ pub(super) fn project_pane_metadata(terminal: &mut TerminalState, info: &PaneInf
 /// The render inputs the mirror reconstructs from a server [`WorkspaceInfo`].
 pub(super) struct ProjectedWorkspace {
     pub(super) branch: Option<String>,
+    pub(super) git_ahead_behind: Option<(usize, usize)>,
     pub(super) worktree_space: Option<WorktreeSpaceMembership>,
 }
 
@@ -479,6 +483,8 @@ pub(super) fn project_workspace_metadata(info: &WorkspaceInfo) -> ProjectedWorks
         // Aggregated by the renderer from each pane's projected agent state.
         agent_status: _,
         branch,
+        git_ahead,
+        git_behind,
         worktree,
     } = info;
 
@@ -490,8 +496,17 @@ pub(super) fn project_workspace_metadata(info: &WorkspaceInfo) -> ProjectedWorks
         is_linked_worktree: worktree.is_linked_worktree,
     });
 
+    // The server sends ahead/behind as a paired option; reconstruct the tuple the
+    // sidebar consumes only when both counts are present (i.e. the branch tracks
+    // an upstream).
+    let git_ahead_behind = match (git_ahead, git_behind) {
+        (Some(ahead), Some(behind)) => Some((*ahead, *behind)),
+        _ => None,
+    };
+
     ProjectedWorkspace {
         branch: branch.clone(),
+        git_ahead_behind,
         worktree_space,
     }
 }
@@ -602,6 +617,8 @@ mod tests {
             active_tab_id: "tab1".into(),
             agent_status: AgentStatus::Unknown,
             branch: Some("feat/x".into()),
+            git_ahead: Some(2),
+            git_behind: Some(1),
             worktree,
         }
     }
@@ -619,6 +636,7 @@ mod tests {
         let projected = project_workspace_metadata(&info);
 
         assert_eq!(projected.branch.as_deref(), Some("feat/x"));
+        assert_eq!(projected.git_ahead_behind, Some((2, 1)));
         let space = projected.worktree_space.expect("worktree space projected");
         assert_eq!(space.key, "repo-key");
         assert_eq!(space.label, "herdr");

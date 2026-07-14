@@ -678,6 +678,43 @@
                 "layout"
               ],
               "type": "object"
+            },
+            {
+              "description": "A server-side notification/toast was raised (e.g. an agent finished or\nneeds attention). Carries the display text plus the optional pane/\nworkspace it targets, so a mirror client can show the same toast the\nserver TUI does.",
+              "properties": {
+                "context": {
+                  "type": "string"
+                },
+                "kind": {
+                  "$ref": "#/schemas/event/$defs/NotificationKind"
+                },
+                "pane_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "title": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "notification_shown",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "type",
+                "kind",
+                "title",
+                "context"
+              ],
+              "type": "object"
             }
           ]
         },
@@ -707,7 +744,17 @@
             "pane_exited",
             "pane_agent_detected",
             "pane_agent_status_changed",
-            "layout_updated"
+            "layout_updated",
+            "notification_shown"
+          ],
+          "type": "string"
+        },
+        "NotificationKind": {
+          "description": "The kind of a server notification/toast, the wire form of the TUI's\n`ToastKind`. Mirror clients render this to reproduce server toasts (e.g. an\nagent finishing) that would otherwise only be visible in the server TUI.",
+          "enum": [
+            "needs_attention",
+            "finished",
+            "update_installed"
           ],
           "type": "string"
         },
@@ -1039,6 +1086,24 @@
             },
             "focused": {
               "type": "boolean"
+            },
+            "git_ahead": {
+              "description": "Commits the workspace branch is ahead of its upstream, when tracking one.\nPaired with `git_behind` so clients (e.g. the mirror TUI) render the same\nahead/behind arrows as the server TUI sidebar. Both are `None` when the\nbranch has no upstream or the workspace is not a git checkout.",
+              "format": "uint",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "git_behind": {
+              "description": "Commits the workspace branch is behind its upstream. See `git_ahead`.",
+              "format": "uint",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
             },
             "label": {
               "type": "string"
@@ -3614,6 +3679,18 @@
               "properties": {
                 "type": {
                   "const": "layout.updated",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "notification.shown",
                   "type": "string"
                 }
               },
@@ -6399,6 +6476,43 @@
                 "layout"
               ],
               "type": "object"
+            },
+            {
+              "description": "A server-side notification/toast was raised (e.g. an agent finished or\nneeds attention). Carries the display text plus the optional pane/\nworkspace it targets, so a mirror client can show the same toast the\nserver TUI does.",
+              "properties": {
+                "context": {
+                  "type": "string"
+                },
+                "kind": {
+                  "$ref": "#/schemas/success_response/$defs/NotificationKind"
+                },
+                "pane_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "title": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "notification_shown",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "type",
+                "kind",
+                "title",
+                "context"
+              ],
+              "type": "object"
             }
           ]
         },
@@ -6443,7 +6557,8 @@
             "pane_exited",
             "pane_agent_detected",
             "pane_agent_status_changed",
-            "layout_updated"
+            "layout_updated",
+            "notification_shown"
           ],
           "type": "string"
         },
@@ -6691,6 +6806,15 @@
               "type": "object"
             }
           ]
+        },
+        "NotificationKind": {
+          "description": "The kind of a server notification/toast, the wire form of the TUI's\n`ToastKind`. Mirror clients render this to reproduce server toasts (e.g. an\nagent finishing) that would otherwise only be visible in the server TUI.",
+          "enum": [
+            "needs_attention",
+            "finished",
+            "update_installed"
+          ],
+          "type": "string"
         },
         "NotificationShowReason": {
           "enum": [
@@ -9191,6 +9315,24 @@
             },
             "focused": {
               "type": "boolean"
+            },
+            "git_ahead": {
+              "description": "Commits the workspace branch is ahead of its upstream, when tracking one.\nPaired with `git_behind` so clients (e.g. the mirror TUI) render the same\nahead/behind arrows as the server TUI sidebar. Both are `None` when the\nbranch has no upstream or the workspace is not a git checkout.",
+              "format": "uint",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "git_behind": {
+              "description": "Commits the workspace branch is behind its upstream. See `git_ahead`.",
+              "format": "uint",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
             },
             "label": {
               "type": "string"
