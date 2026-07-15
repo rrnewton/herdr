@@ -26,6 +26,26 @@ OS、外側のターミナル名とバージョン、ローカルまたはリモ
 
 長期サポート版 Linux ディストリビューションの古いターミナルパッケージで特に発生します。確認済みの境界キャプチャと上流参照は [Herdr issue #1116](https://github.com/ogulcancelik/herdr/issues/1116) を参照してください。現在のターミナルでも発生する場合は、正確なバージョンと Herdr の外でも発生するかを報告してください。
 
+## Option+Left または Option+Right を押すと `;3D` または `;3C` が入力される
+
+ターミナルは一般に、Alt+Left と Alt+Right を標準の修飾付き矢印シーケンス `ESC[1;3D` と `ESC[1;3C` として送信します。macOS では、まず外側のターミナルで Option を Alt として扱うよう設定する必要があります。シェルがこれらのシーケンスを割り当てていない場合、zsh は残りの文字を `;3D` または `;3C` と表示することがあります。これは kitty、Alacritty、その他のターミナルで発生する可能性があります。Herdr と tmux はどちらも元の修飾付き矢印入力を保持します。
+
+すべてのターミナルとネストしたシェルで修飾付き矢印を単語移動として使う場合は、zsh のバインドを明示的に追加します:
+
+```zsh
+bindkey $'\e[1;3D' backward-word
+bindkey $'\e[1;3C' forward-word
+```
+
+kitty の外では動作するのに Herdr 内では動作しないことがあります。これは kitty の自動 zsh インテグレーションが、kitty が直接起動したシェルにだけこれらのバインドを追加し、ターミナルマルチプレクサーが起動したシェルには追加しないためです。kitty の[手動シェルインテグレーション手順](https://sw.kovidgoyal.net/kitty/shell-integration/#manual-shell-integration)に従うか、シェルへ届く前に `kitty.conf` でキーを割り当ててください:
+
+```text
+map alt+left send_text all \x1bb
+map alt+right send_text all \x1bf
+```
+
+ターミナルアプリケーションが Alt+Left と Alt+Right を直接使用する場合があるため、Herdr は修飾付き矢印を意図的に書き換えません。調査の詳細は [Herdr issue #1370](https://github.com/ogulcancelik/herdr/issues/1370) を参照してください。
+
 ## Herdr を更新したのに実行中のセッションが古い
 
 バイナリを更新しても、互換性のある実行中サーバーは自動で置き換わらないことがあります。`herdr status` を確認してください。更新済みサーバーを起動するには、セッションを停止して Herdr を再起動します:

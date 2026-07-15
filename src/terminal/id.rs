@@ -20,6 +20,15 @@ impl TerminalId {
         let counter = NEXT_TERMINAL_ID.fetch_add(1, Ordering::Relaxed);
         Self(format!("term_{micros:x}{counter:x}"))
     }
+
+    /// Reconstruct a terminal id from a server-authoritative string (e.g. a
+    /// `terminal_id` returned over the JSON API). This preserves the server's
+    /// existing identity for a replicated/mirror client; it is **not** a way to
+    /// derive an id from a pane id or layout position (see the type doc).
+    #[cfg(unix)]
+    pub(crate) fn from_string(id: String) -> Self {
+        Self(id)
+    }
 }
 
 impl fmt::Display for TerminalId {

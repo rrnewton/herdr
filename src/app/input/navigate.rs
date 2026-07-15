@@ -43,6 +43,28 @@ pub(crate) fn terminal_direct_indexed_navigation_action(
     indexed_navigation_action(state, key, BindingDispatch::Direct)
 }
 
+/// Prefix-mode keybinding → action mapping, reused by the mirror session driver
+/// so it classifies keys with the exact same user-configured bindings the server
+/// app uses (`design-mirror-tui.md` §3.4). The mirror maps the resulting action
+/// to a local view mutation or a JSON API call rather than mutating server state.
+#[cfg(unix)]
+pub(crate) fn prefix_non_indexed_navigation_action(
+    state: &AppState,
+    key: TerminalKey,
+) -> Option<NavigateAction> {
+    non_indexed_action_for_key(state, key, BindingDispatch::Prefix)
+}
+
+/// Prefix-mode indexed (`switch_tab`/`switch_workspace`/`focus_agent`) mapping,
+/// companion to [`prefix_non_indexed_navigation_action`].
+#[cfg(unix)]
+pub(crate) fn prefix_indexed_navigation_action(
+    state: &AppState,
+    key: TerminalKey,
+) -> Option<NavigateAction> {
+    indexed_navigation_action(state, key, BindingDispatch::Prefix)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ActionContext {
     Direct,
@@ -176,7 +198,7 @@ impl App {
         }
     }
 
-    pub(super) fn execute_tui_navigate_action(
+    pub(crate) fn execute_tui_navigate_action(
         &mut self,
         action: NavigateAction,
         context: ActionContext,
@@ -778,6 +800,7 @@ impl App {
             crate::config::CustomCommandAction::Pane => {
                 self.spawn_pane_command(&binding.command, Vec::new())
             }
+            crate::config::CustomCommandAction::Popup => self.spawn_custom_popup_command(&binding),
             crate::config::CustomCommandAction::PluginAction => self
                 .invoke_plugin_action_from_keybind(binding.command.clone())
                 .map_err(std::io::Error::other),
@@ -796,6 +819,21 @@ impl App {
                 finish_custom_command_context(&mut self.state, context, previous_mode);
             }
         }
+    }
+
+    fn spawn_custom_popup_command(
+        &mut self,
+        binding: &crate::config::CustomCommandKeybind,
+    ) -> io::Result<()> {
+        self.spawn_popup_shell_command(
+            &binding.command,
+            None,
+            self.custom_command_env().0,
+            crate::app::popup::PopupGeometry {
+                width: binding.width,
+                height: binding.height,
+            },
+        )
     }
 
     fn custom_command_env(&self) -> (Vec<(String, String)>, Option<std::path::PathBuf>) {
@@ -843,7 +881,7 @@ impl App {
     }
 
     fn spawn_custom_command(
-        &self,
+        &mut self,
         binding: &crate::config::CustomCommandKeybind,
     ) -> std::io::Result<()> {
         let mut command = crate::platform::detached_custom_command_process(&binding.command);
@@ -856,7 +894,8 @@ impl App {
         if let Some(cwd) = cwd {
             command.current_dir(cwd);
         }
-        command.spawn()?;
+        let child = command.spawn()?;
+        self.detached_custom_command_children.push(child);
         Ok(())
     }
 
@@ -2943,9 +2982,11 @@ navigate_pane_down = "ctrl+j"
         app.state.mode = Mode::Terminal;
 
         let output_path = unique_temp_path("custom-command-keybind");
+        let release_path = unique_temp_path("custom-command-release");
         let command = format!(
-            "printf '%s\\n%s\\n%s\\n' \"$HERDR_ACTIVE_WORKSPACE_ID\" \"$HERDR_ACTIVE_TAB_ID\" \"$HERDR_ACTIVE_PANE_ID\" > '{}'",
-            output_path.display()
+            "printf '%s\\n%s\\n%s\\n%s\\n' \"$$\" \"$HERDR_ACTIVE_WORKSPACE_ID\" \"$HERDR_ACTIVE_TAB_ID\" \"$HERDR_ACTIVE_PANE_ID\" > '{}'; i=0; while [ ! -e '{}' ] && [ \"$i\" -lt 250 ]; do sleep 0.02; i=$((i + 1)); done",
+            output_path.display(),
+            release_path.display(),
         );
         app.state.keybinds.custom_commands = vec![crate::config::CustomCommandKeybind {
             bindings: crate::config::ActionKeybinds::prefix("m"),
@@ -2953,6 +2994,8 @@ navigate_pane_down = "ctrl+j"
             command,
             action: crate::config::CustomCommandAction::Shell,
             description: None,
+            width: None,
+            height: None,
         }];
 
         app.handle_key(TerminalKey::new(
@@ -2962,18 +3005,48 @@ navigate_pane_down = "ctrl+j"
         .await;
         assert_eq!(app.state.mode, Mode::Prefix);
 
+        let launch_started = std::time::Instant::now();
         app.handle_key(TerminalKey::new(KeyCode::Char('m'), KeyModifiers::empty()))
             .await;
+        assert!(launch_started.elapsed() < Duration::from_secs(2));
 
         let content = wait_for_file(&output_path);
         let lines: Vec<&str> = content.lines().collect();
-        assert_eq!(lines.len(), 3);
-        assert_eq!(lines[0], app.state.workspaces[0].id);
-        assert_eq!(lines[1], format!("{}:t1", app.state.workspaces[0].id));
-        assert_eq!(lines[2], format!("{}:p1", app.state.workspaces[0].id));
+        assert_eq!(lines.len(), 4);
+        let pid = lines[0]
+            .parse::<u32>()
+            .expect("command should report its pid");
+        assert!(crate::platform::process_exists(pid));
+        assert_eq!(lines[1], app.state.workspaces[0].id);
+        assert_eq!(lines[2], format!("{}:t1", app.state.workspaces[0].id));
+        assert_eq!(lines[3], format!("{}:p1", app.state.workspaces[0].id));
         assert_eq!(app.state.mode, Mode::Terminal);
 
+        std::fs::write(&release_path, b"release").expect("release command");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while crate::platform::process_exists(pid) && tokio::time::Instant::now() < deadline {
+            app.reap_finished_custom_commands();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        app.reap_finished_custom_commands();
+        let reaped_by_runtime = !crate::platform::process_exists(pid);
+        if !reaped_by_runtime {
+            if let Some(child) = app
+                .detached_custom_command_children
+                .iter_mut()
+                .find(|child| child.id() == pid)
+            {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+        assert!(
+            reaped_by_runtime,
+            "detached command child {pid} was not reaped"
+        );
+
         let _ = std::fs::remove_file(output_path);
+        let _ = std::fs::remove_file(release_path);
     }
 
     #[cfg(unix)]
@@ -3015,6 +3088,8 @@ navigate_pane_down = "ctrl+j"
             command,
             action: crate::config::CustomCommandAction::Pane,
             description: None,
+            width: None,
+            height: None,
         }];
 
         app.handle_key(TerminalKey::new(

@@ -10,6 +10,15 @@ use super::App;
 
 impl App {
     pub(crate) fn dispatch_runtime_mutation(&mut self, id: &'static str, method: Method) -> String {
+        // Mirror capture seam: when enabled, record the mutation for the client
+        // to forward to the authoritative server over the JSON API instead of
+        // applying it against this PTY-less replica `App`. Keeps every structural
+        // action (present and future) routed to the server with no per-action
+        // curation. Inert (`None`) for the server/monolithic app.
+        if let Some(captured) = self.captured_runtime_mutations.as_mut() {
+            captured.push(method);
+            return String::new();
+        }
         self.dispatch_api_request(id, method)
     }
 
@@ -18,6 +27,10 @@ impl App {
         id: &'static str,
         method: Method,
     ) -> Option<String> {
+        if let Some(captured) = self.captured_runtime_mutations.as_mut() {
+            captured.push(method);
+            return None;
+        }
         self.dispatch_deferred_api_request(id, method)
     }
 

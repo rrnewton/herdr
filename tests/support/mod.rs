@@ -15,7 +15,7 @@ static INIT: Once = Once::new();
 static CLEANUP_GUARD: OnceLock<CleanupGuard> = OnceLock::new();
 const WATCHDOG_SCAN_INTERVAL: Duration = Duration::from_secs(1);
 const RUNTIME_OWNER_MARKER: &str = ".herdr-test-owner-pid";
-pub const CURRENT_PROTOCOL: u32 = 16;
+pub const CURRENT_PROTOCOL: u32 = 17;
 
 pub fn register_spawned_herdr_pid(pid: Option<u32>) {
     let Some(pid) = pid else {
@@ -172,6 +172,30 @@ pub fn decode_varint_u32(payload: &[u8], offset: usize) -> Result<(u32, usize), 
     }
 }
 
+/// Decodes a bincode variable-length `u64` at `offset`, returning the value and
+/// the number of bytes consumed. Mirrors bincode's standard varint encoding.
+pub fn decode_varint_u64(payload: &[u8], offset: usize) -> Result<(u64, usize), String> {
+    if offset >= payload.len() {
+        return Err("payload too short for varint".into());
+    }
+    let first_byte = payload[offset];
+    let read = |n: usize| -> Result<[u8; 8], String> {
+        if offset + 1 + n > payload.len() {
+            return Err(format!("payload too short for {n}-byte varint"));
+        }
+        let mut buf = [0u8; 8];
+        buf[..n].copy_from_slice(&payload[offset + 1..offset + 1 + n]);
+        Ok(buf)
+    };
+    match first_byte {
+        0..=250 => Ok((first_byte as u64, 1)),
+        251 => Ok((u64::from_le_bytes(read(2)?), 3)),
+        252 => Ok((u64::from_le_bytes(read(4)?), 5)),
+        253 => Ok((u64::from_le_bytes(read(8)?), 9)),
+        _ => Err(format!("unsupported u64 varint tag: {first_byte}")),
+    }
+}
+
 fn encode_varint_enum(variant_idx: u32, fields: &[&[u8]]) -> Vec<u8> {
     let mut buf = encode_varint_u32(variant_idx);
     for field in fields {
@@ -241,6 +265,47 @@ pub fn client_handshake(
             &encode_varint_u32(0),  // RenderEncoding::SemanticFrame
             &encode_varint_u32(0),  // ClientKeybindings::Server
             &encode_varint_u32(0),  // ClientLaunchMode::App
+        ],
+    );
+    let framed = frame_message(&hello_payload);
+    stream.write_all(&framed).map_err(|e| e.to_string())?;
+    stream.flush().map_err(|e| e.to_string())?;
+
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf).map_err(|e| e.to_string())?;
+    let len = u32::from_le_bytes(len_buf) as usize;
+    if len > 2 * 1024 * 1024 {
+        return Err(format!("oversized response: {len}"));
+    }
+
+    let mut payload = vec![0u8; len];
+    stream.read_exact(&mut payload).map_err(|e| e.to_string())?;
+    decode_welcome(&payload)
+}
+
+/// Handshake as a direct terminal-session client (observe/control/mirror),
+/// i.e. `ClientLaunchMode::TerminalAttach` with the `TerminalAnsi` encoding.
+pub fn client_handshake_direct(
+    stream: &mut UnixStream,
+    version: u32,
+    cols: u16,
+    rows: u16,
+) -> Result<(u32, Option<String>), String> {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .map_err(|e| e.to_string())?;
+
+    let hello_payload = encode_varint_enum(
+        0,
+        &[
+            &encode_varint_u32(version),
+            &encode_varint_u16(cols),
+            &encode_varint_u16(rows),
+            &encode_varint_u32(8),  // cell_width_px
+            &encode_varint_u32(16), // cell_height_px
+            &encode_varint_u32(1),  // RenderEncoding::TerminalAnsi
+            &encode_varint_u32(0),  // ClientKeybindings::Server
+            &encode_varint_u32(1),  // ClientLaunchMode::TerminalAttach
         ],
     );
     let framed = frame_message(&hello_payload);

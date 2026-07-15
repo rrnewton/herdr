@@ -27,6 +27,10 @@ mod agent_detection;
 mod cursor;
 mod input;
 mod kitty_keyboard;
+// The interactive local mirror client (and its emulator) is Unix-only for now,
+// sharing the direct-attach raw input path.
+#[cfg(unix)]
+mod mirror;
 mod osc;
 mod state;
 mod terminal;
@@ -39,6 +43,8 @@ use self::agent_detection::{
     DetectionScreenReadInput, PendingIdleConfirmation, ScreenDetectionPublishInput,
     AGENT_PENDING_IDLE_RECHECK, AGENT_STARTUP_GRACE_WINDOW,
 };
+#[cfg(unix)]
+pub(crate) use self::mirror::{LocalMirror, MirrorApplyOutcome, MirrorRuntime};
 use self::terminal::{GhosttyPaneTerminal, PaneTerminal};
 pub(crate) use self::terminal::{
     TerminalDirtyPatch, TerminalDirtyPatchOutcome, TerminalTextMatch, TerminalTextPoint,
@@ -65,21 +71,26 @@ fn apply_pane_terminal_env(cmd: &mut CommandBuilder) {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct PaneLaunchEnv {
     extra: Vec<(String, String)>,
-    identity: Option<PaneLaunchIdentity>,
+    identity: PaneLaunchIdentity,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PaneLaunchIdentity {
-    workspace_id: String,
-    tab_id: String,
-    pane_id: String,
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+enum PaneLaunchIdentity {
+    #[default]
+    Inherit,
+    Managed {
+        workspace_id: String,
+        tab_id: String,
+        pane_id: String,
+    },
+    OmitPane,
 }
 
 impl PaneLaunchEnv {
     pub(crate) fn from_extra(extra: Vec<(String, String)>) -> Self {
         Self {
             extra,
-            identity: None,
+            identity: PaneLaunchIdentity::Inherit,
         }
     }
 
@@ -89,11 +100,16 @@ impl PaneLaunchEnv {
         tab_id: String,
         pane_id: String,
     ) -> Self {
-        self.identity = Some(PaneLaunchIdentity {
+        self.identity = PaneLaunchIdentity::Managed {
             workspace_id,
             tab_id,
             pane_id,
-        });
+        };
+        self
+    }
+
+    pub(crate) fn without_pane_identity(mut self) -> Self {
+        self.identity = PaneLaunchIdentity::OmitPane;
         self
     }
 }
@@ -104,13 +120,20 @@ fn apply_pane_launch_env(cmd: &mut CommandBuilder, launch_env: &PaneLaunchEnv) {
     }
     cmd.env(crate::HERDR_ENV_VAR, crate::HERDR_ENV_VALUE);
     crate::integration::apply_pane_base_env(cmd);
-    if let Some(identity) = &launch_env.identity {
-        cmd.env(
-            crate::integration::HERDR_WORKSPACE_ID_ENV_VAR,
-            &identity.workspace_id,
-        );
-        cmd.env(crate::integration::HERDR_TAB_ID_ENV_VAR, &identity.tab_id);
-        cmd.env(crate::integration::HERDR_PANE_ID_ENV_VAR, &identity.pane_id);
+    match &launch_env.identity {
+        PaneLaunchIdentity::Inherit => {}
+        PaneLaunchIdentity::Managed {
+            workspace_id,
+            tab_id,
+            pane_id,
+        } => {
+            cmd.env(crate::integration::HERDR_WORKSPACE_ID_ENV_VAR, workspace_id);
+            cmd.env(crate::integration::HERDR_TAB_ID_ENV_VAR, tab_id);
+            cmd.env(crate::integration::HERDR_PANE_ID_ENV_VAR, pane_id);
+        }
+        PaneLaunchIdentity::OmitPane => {
+            cmd.env_remove(crate::integration::HERDR_PANE_ID_ENV_VAR);
+        }
     }
 }
 
@@ -125,6 +148,12 @@ struct SpawnInitialState<'a> {
     detected_agent: Option<Agent>,
     history_ansi: Option<&'a str>,
     windows_powershell_prompt_cwd_reporting: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AgentDetection {
+    Enabled,
+    Disabled,
 }
 
 fn active_pending_release(
@@ -912,12 +941,16 @@ pub struct PaneRuntime {
     child_wait_completed: Option<Arc<AtomicBool>>,
     kitty_keyboard_flags: Arc<AtomicU16>,
     detection_content_seq: Arc<AtomicU64>,
+    /// Raw child PTY output + resize replication log for the responsive local
+    /// mirror. Recorded on the PTY read path; read by the server to stream to
+    /// mirror clients.
+    output_log: Arc<crate::terminal::MirrorLog>,
     full_lifecycle_authority_active: Arc<AtomicBool>,
     detect_reset_notify: Arc<Notify>,
     pending_release: Arc<Mutex<Option<PendingAgentRelease>>>,
     preserve_processes_on_drop: bool,
     // Task handles for deterministic shutdown
-    detect_handle: tokio::task::AbortHandle,
+    detect_handle: Option<tokio::task::AbortHandle>,
 }
 
 enum PaneRuntimeIo {
@@ -1061,7 +1094,9 @@ impl Drop for PaneRuntime {
     fn drop(&mut self) {
         // Abort detection task immediately and terminate the owned session.
         // The PTY actor shuts down before the process/session policy runs.
-        self.detect_handle.abort();
+        if let Some(handle) = &self.detect_handle {
+            handle.abort();
+        }
         self.io.shutdown();
         if !self.preserve_processes_on_drop {
             shutdown_pane_processes(
@@ -1385,6 +1420,24 @@ fn usable_reported_cwd(cwd: std::path::PathBuf) -> Option<std::path::PathBuf> {
     (cwd.is_absolute() && cwd.is_dir()).then_some(cwd)
 }
 
+/// Records raw child PTY output into the terminal's mirror log and, when a
+/// mirror client is attached, wakes the server event loop so the new output is
+/// streamed promptly — even for output the terminal emulator did not consider
+/// render-worthy.
+fn record_mirror_output(
+    bytes: &[u8],
+    output_log: &Arc<crate::terminal::MirrorLog>,
+    render_notify: &Arc<Notify>,
+) {
+    if bytes.is_empty() {
+        return;
+    }
+    output_log.record_output(bytes);
+    if output_log.has_subscribers() {
+        render_notify.notify_one();
+    }
+}
+
 fn publish_reported_cwd(
     pane_id: PaneId,
     cwd: std::path::PathBuf,
@@ -1411,7 +1464,9 @@ fn publish_reported_cwd(
 
 impl PaneRuntime {
     pub fn shutdown(mut self) {
-        self.detect_handle.abort();
+        if let Some(handle) = self.detect_handle.take() {
+            handle.abort();
+        }
         self.io.shutdown();
         shutdown_pane_processes(
             self.pane_id,
@@ -1435,7 +1490,9 @@ impl PaneRuntime {
                 "failed to release PTY actor after handoff commit; dropping runtime will still close the actor handle"
             );
         }
-        self.detect_handle.abort();
+        if let Some(handle) = self.detect_handle.take() {
+            handle.abort();
+        }
         self.preserve_processes_on_drop = true;
     }
 
@@ -1481,6 +1538,7 @@ impl PaneRuntime {
             },
             keyboard_protocol_ansi: self.terminal.kitty_keyboard_state_ansi(),
             input_state: self.input_state(),
+            terminal_title: self.terminal_title(),
             initial_history_ansi: None,
         }
     }
@@ -1570,6 +1628,7 @@ impl PaneRuntime {
                 history_ansi: initial_history_ansi,
                 windows_powershell_prompt_cwd_reporting,
             },
+            AgentDetection::Enabled,
         )
     }
 
@@ -1582,6 +1641,7 @@ impl PaneRuntime {
         cwd: std::path::PathBuf,
         command: &str,
         launch_env: &PaneLaunchEnv,
+        agent_detection: AgentDetection,
         scrollback_limit_bytes: usize,
         host_terminal_theme: crate::terminal_theme::TerminalTheme,
         events: mpsc::Sender<AppEvent>,
@@ -1604,9 +1664,12 @@ impl PaneRuntime {
             cmd,
             "failed to spawn command pane",
             SpawnInitialState::default(),
+            agent_detection,
         )
     }
 
+    // Runtime construction needs to thread PTY size, environment, theme, render hooks, and detection policy together.
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn_argv_command(
         pane_id: PaneId,
         rows: u16,
@@ -1614,6 +1677,7 @@ impl PaneRuntime {
         cwd: std::path::PathBuf,
         argv: &[String],
         launch_env: &PaneLaunchEnv,
+        agent_detection: AgentDetection,
         scrollback_limit_bytes: usize,
         host_terminal_theme: crate::terminal_theme::TerminalTheme,
         events: mpsc::Sender<AppEvent>,
@@ -1645,6 +1709,7 @@ impl PaneRuntime {
             cmd,
             "failed to spawn argv command pane",
             SpawnInitialState::default(),
+            agent_detection,
         )
     }
 
@@ -1668,6 +1733,7 @@ impl PaneRuntime {
             keyboard_protocol_flags,
             keyboard_protocol_ansi,
             input_state,
+            terminal_title,
             initial_history_ansi,
         } = state;
         let pane_id = PaneId::from_raw(pane_id);
@@ -1688,6 +1754,7 @@ impl PaneRuntime {
         }
         let pane_terminal = GhosttyPaneTerminal::new(terminal, response_tx.clone())?;
         pane_terminal.apply_host_terminal_theme(host_terminal_theme);
+        pane_terminal.seed_terminal_title(terminal_title);
         if let Some(input_state) = input_state {
             pane_terminal.seed_handoff_input_state(input_state);
         }
@@ -1704,6 +1771,7 @@ impl PaneRuntime {
         let reported_cwd = Arc::new(Mutex::new(None));
         let kitty_keyboard_flags = Arc::new(AtomicU16::new(keyboard_protocol_flags));
         let detection_content_seq = Arc::new(AtomicU64::new(0));
+        let output_log = Arc::new(crate::terminal::MirrorLog::new(cols, rows));
 
         let io = {
             let terminal = terminal.clone();
@@ -1711,6 +1779,7 @@ impl PaneRuntime {
             let render_notify = render_notify.clone();
             let render_dirty = render_dirty.clone();
             let detection_content_seq = detection_content_seq.clone();
+            let output_log = output_log.clone();
             let child_pid = child_pid.clone();
             let read_events = events.clone();
             let reported_cwd = reported_cwd.clone();
@@ -1721,6 +1790,7 @@ impl PaneRuntime {
                 let result =
                     terminal.process_pty_bytes(pane_id, shell_pid, bytes, &response_writer);
                 observe_detection_content_change(bytes, &detection_content_seq);
+                record_mirror_output(bytes, &output_log, &render_notify);
                 if result.request_render && !render_dirty.swap(true, Ordering::AcqRel) {
                     render_notify.notify_one();
                 }
@@ -1784,14 +1854,17 @@ impl PaneRuntime {
             child_wait_completed: None,
             kitty_keyboard_flags,
             detection_content_seq,
+            output_log,
             full_lifecycle_authority_active,
             detect_reset_notify,
             pending_release,
             preserve_processes_on_drop: true,
-            detect_handle,
+            detect_handle: Some(detect_handle),
         })
     }
 
+    // Runtime construction needs to thread PTY size, environment, theme, render hooks, and detection policy together.
+    #[allow(clippy::too_many_arguments)]
     fn spawn_command_builder(
         pane_id: PaneId,
         rows: u16,
@@ -1804,6 +1877,7 @@ impl PaneRuntime {
         cmd: CommandBuilder,
         spawn_error_message: &'static str,
         initial_state: SpawnInitialState<'_>,
+        agent_detection: AgentDetection,
     ) -> std::io::Result<Self> {
         crate::logging::pane_spawn_started(pane_id.raw(), rows, cols, scrollback_limit_bytes);
 
@@ -1837,6 +1911,7 @@ impl PaneRuntime {
         let reported_cwd = Arc::new(Mutex::new(None));
         let child_wait_completed = Arc::new(AtomicBool::new(false));
         let detection_content_seq = Arc::new(AtomicU64::new(0));
+        let output_log = Arc::new(crate::terminal::MirrorLog::new(cols, rows));
         let full_lifecycle_authority_active = Arc::new(AtomicBool::new(false));
         {
             let child_pid = child_pid.clone();
@@ -1870,6 +1945,7 @@ impl PaneRuntime {
             let render_notify = render_notify.clone();
             let render_dirty = render_dirty.clone();
             let detection_content_seq = detection_content_seq.clone();
+            let output_log = output_log.clone();
             let child_pid = child_pid.clone();
             let events = events.clone();
             let reported_cwd = reported_cwd.clone();
@@ -1878,7 +1954,10 @@ impl PaneRuntime {
                 let shell_pid = child_pid.load(Ordering::Acquire);
                 let result =
                     terminal.process_pty_bytes(pane_id, shell_pid, bytes, &response_writer);
-                observe_detection_content_change(bytes, &detection_content_seq);
+                if agent_detection == AgentDetection::Enabled {
+                    observe_detection_content_change(bytes, &detection_content_seq);
+                }
+                record_mirror_output(bytes, &output_log, &render_notify);
                 if result.request_render && !render_dirty.swap(true, Ordering::AcqRel) {
                     render_notify.notify_one();
                 }
@@ -1921,7 +2000,9 @@ impl PaneRuntime {
         };
 
         // --- Detection task ---
-        let (detect_handle, detect_reset_notify, pending_release) = {
+        let (detect_handle, detect_reset_notify, pending_release) = if agent_detection
+            == AgentDetection::Enabled
+        {
             use crate::detect;
             use std::time::{Duration, Instant};
 
@@ -2279,7 +2360,13 @@ impl PaneRuntime {
                     }
                 }
             });
-            (handle.abort_handle(), detect_reset_notify, pending_release)
+            (
+                Some(handle.abort_handle()),
+                detect_reset_notify,
+                pending_release,
+            )
+        } else {
+            (None, Arc::new(Notify::new()), Arc::new(Mutex::new(None)))
         };
 
         Ok(Self {
@@ -2292,6 +2379,7 @@ impl PaneRuntime {
             child_wait_completed: Some(child_wait_completed),
             kitty_keyboard_flags,
             detection_content_seq,
+            output_log,
             full_lifecycle_authority_active,
             detect_reset_notify,
             pending_release,
@@ -2319,6 +2407,11 @@ impl PaneRuntime {
         self.detect_reset_notify.clone()
     }
 
+    #[cfg(test)]
+    pub(crate) fn agent_detection_enabled_for_test(&self) -> bool {
+        self.detect_handle.is_some()
+    }
+
     pub fn set_full_lifecycle_authority_active(&self, active: bool) {
         let previous = self
             .full_lifecycle_authority_active
@@ -2342,6 +2435,7 @@ impl PaneRuntime {
             return;
         }
         self.current_size.set(size);
+        self.output_log.record_resize(cols, rows);
         let terminal_responses = self
             .terminal
             .resize(rows, cols, cell_width_px, cell_height_px);
@@ -2353,6 +2447,12 @@ impl PaneRuntime {
             cell_height_px,
             terminal_responses,
         );
+    }
+
+    /// Shared handle to this terminal's raw output replication log, used by the
+    /// server to stream the responsive local mirror.
+    pub fn output_log(&self) -> Arc<crate::terminal::MirrorLog> {
+        self.output_log.clone()
     }
 
     #[cfg(unix)]
@@ -2450,6 +2550,10 @@ impl PaneRuntime {
         self.terminal.detection_text()
     }
 
+    pub fn terminal_title(&self) -> Option<String> {
+        self.terminal.terminal_title()
+    }
+
     pub fn agent_osc_title(&self) -> String {
         self.terminal.agent_osc_title()
     }
@@ -2531,6 +2635,14 @@ impl PaneRuntime {
     }
 
     pub async fn send_paste(&self, text: String) -> Result<(), mpsc::error::SendError<Bytes>> {
+        self.send_bytes(self.paste_payload(text)).await
+    }
+
+    pub fn try_send_paste(&self, text: String) -> Result<(), mpsc::error::TrySendError<Bytes>> {
+        self.try_send_bytes(self.paste_payload(text))
+    }
+
+    fn paste_payload(&self, text: String) -> Bytes {
         let bracketed = self
             .input_state()
             .map(|state| state.bracketed_paste)
@@ -2540,7 +2652,7 @@ impl PaneRuntime {
         } else {
             text
         };
-        self.send_bytes(Bytes::from(payload)).await
+        Bytes::from(payload)
     }
 
     pub fn try_send_focus_event(&self, event: crate::ghostty::FocusEvent) -> bool {
@@ -2732,11 +2844,12 @@ impl PaneRuntime {
                 child_wait_completed: None,
                 kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
                 detection_content_seq: Arc::new(AtomicU64::new(0)),
+                output_log: Arc::new(crate::terminal::MirrorLog::new(cols, rows)),
                 full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
                 detect_reset_notify: Arc::new(Notify::new()),
                 pending_release: Arc::new(Mutex::new(None)),
                 preserve_processes_on_drop: true,
-                detect_handle: tokio::spawn(async {}).abort_handle(),
+                detect_handle: Some(tokio::spawn(async {}).abort_handle()),
             },
             rx,
         )
@@ -3121,16 +3234,20 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn handoff_runtime_state_captures_terminal_input_state() {
+    async fn handoff_runtime_state_captures_terminal_input_and_title_state() {
         let runtime = PaneRuntime::test_with_screen_bytes(
             80,
             24,
             b"\x1b[>5u\x1b[>4;2m\x1b[?1h\x1b[?2004h\x1b[?1004h\x1b[?1002h\x1b[?1006h",
         );
 
+        runtime.test_process_pty_bytes("\x1b]2;✳ 修复🙂标题\x1b\\".as_bytes());
+        runtime.terminal.clear_agent_osc_state();
+        assert_eq!(runtime.agent_osc_title(), "");
         let pane = runtime.handoff_runtime_state(12);
 
         assert_eq!(pane.keyboard_protocol_flags, 5);
+        assert_eq!(pane.terminal_title.as_deref(), Some("✳ 修复🙂标题"));
         assert_eq!(
             pane.input_state,
             Some(InputState {
@@ -3190,11 +3307,12 @@ mod tests {
             child_wait_completed: None,
             kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
             detection_content_seq: Arc::new(AtomicU64::new(0)),
+            output_log: Arc::new(crate::terminal::MirrorLog::new(80, 24)),
             full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
             detect_reset_notify: Arc::new(Notify::new()),
             pending_release: Arc::new(Mutex::new(None)),
             preserve_processes_on_drop: true,
-            detect_handle: tokio::spawn(async {}).abort_handle(),
+            detect_handle: Some(tokio::spawn(async {}).abort_handle()),
         };
 
         assert!(runtime.try_send_focus_event(crate::ghostty::FocusEvent::Gained));
@@ -3221,11 +3339,12 @@ mod tests {
             child_wait_completed: None,
             kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
             detection_content_seq: Arc::new(AtomicU64::new(0)),
+            output_log: Arc::new(crate::terminal::MirrorLog::new(80, 24)),
             full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
             detect_reset_notify: Arc::new(Notify::new()),
             pending_release: Arc::new(Mutex::new(None)),
             preserve_processes_on_drop: true,
-            detect_handle: tokio::spawn(async {}).abort_handle(),
+            detect_handle: Some(tokio::spawn(async {}).abort_handle()),
         };
 
         assert!(!runtime.try_send_focus_event(crate::ghostty::FocusEvent::Gained));

@@ -134,6 +134,15 @@ impl ClientControlWriter {
             ClientControlTarget::Channel(sender) => sender.send(data),
         }
     }
+
+    /// Bytes of control payload currently queued for this client's writer thread.
+    pub(crate) fn backlog_bytes(&self) -> usize {
+        match &self.target {
+            ClientControlTarget::Queue(queue) => queue.control_backlog_bytes(),
+            #[cfg(test)]
+            ClientControlTarget::Channel(_) => 0,
+        }
+    }
 }
 
 impl Clone for ClientRenderWriter {
@@ -190,6 +199,10 @@ struct ClientWriterQueue {
 struct ClientWriterQueueState {
     control: VecDeque<Vec<u8>>,
     render: Option<Vec<u8>>,
+    /// Sum of queued control payload bytes, tracked so callers streaming
+    /// high-volume data (the terminal mirror) can apply backpressure without
+    /// scanning the queue.
+    control_bytes: usize,
     senders: usize,
     writer_alive: bool,
 }
@@ -227,9 +240,14 @@ impl ClientWriterQueue {
         if !state.writer_alive {
             return Err(SendError(data));
         }
+        state.control_bytes = state.control_bytes.saturating_add(data.len());
         state.control.push_back(data);
         self.ready.notify_one();
         Ok(())
+    }
+
+    fn control_backlog_bytes(&self) -> usize {
+        self.lock_state().control_bytes
     }
 
     fn try_send_render(&self, data: Vec<u8>) -> Result<(), TrySendError<Vec<u8>>> {
@@ -249,6 +267,7 @@ impl ClientWriterQueue {
         let mut state = self.lock_state();
         loop {
             if let Some(data) = state.control.pop_front() {
+                state.control_bytes = state.control_bytes.saturating_sub(data.len());
                 return Some(ClientWriteItem::Control(data));
             }
             if let Some(data) = state.render.take() {
@@ -319,6 +338,13 @@ pub(crate) enum ServerEvent {
         client_id: u64,
         target: String,
         takeover: bool,
+    },
+    /// A client requested a raw-output mirror of one terminal.
+    ClientMirrorTerminal {
+        client_id: u64,
+        target: String,
+        resume_from: Option<u64>,
+        writable: bool,
     },
     /// A direct terminal attach client requested scrollback movement.
     ClientAttachScroll {
@@ -686,6 +712,16 @@ fn client_read_loop(
                     takeover,
                 }
             }
+            ClientMessage::MirrorTerminal {
+                target,
+                resume_from,
+                writable,
+            } => ServerEvent::ClientMirrorTerminal {
+                client_id,
+                target,
+                resume_from,
+                writable,
+            },
             ClientMessage::ClipboardImage { extension, data } => {
                 if data.len() > MAX_CLIPBOARD_IMAGE_PAYLOAD {
                     warn!(

@@ -44,6 +44,7 @@ impl App {
         match &event.data {
             EventData::WorkspaceCreated { workspace }
             | EventData::WorkspaceUpdated { workspace }
+            | EventData::WorkspaceMetadataUpdated { workspace }
             | EventData::WorktreeCreated { workspace, .. }
             | EventData::WorktreeOpened { workspace, .. } => {
                 self.plugin_context_for_workspace_info(workspace, correlation_id)
@@ -132,7 +133,7 @@ impl App {
                     context.tab_id = Some(layout.tab_id.clone());
                     context
                 }),
-            EventData::PaneCreated { pane } => {
+            EventData::PaneCreated { pane } | EventData::PaneUpdated { pane } => {
                 self.plugin_context_for_pane_info(pane, correlation_id)
             }
             EventData::PaneMoved { pane, .. } => {
@@ -178,6 +179,31 @@ impl App {
                     context.focused_pane_id = Some(pane_id.clone());
                     context
                 }),
+            EventData::NotificationShown {
+                workspace_id,
+                pane_id,
+                ..
+            } => {
+                // Notifications are not currently plugin-hook events (excluded from
+                // `PLUGIN_HOOK_EVENT_KINDS`), so this arm is only reached defensively.
+                // Build the best context we can from the optional target.
+                pane_id
+                    .as_deref()
+                    .and_then(|pane_id| {
+                        self.plugin_context_for_public_pane_id(pane_id, correlation_id)
+                    })
+                    .or_else(|| {
+                        workspace_id.as_deref().and_then(|workspace_id| {
+                            self.plugin_context_for_workspace_id(workspace_id, correlation_id)
+                        })
+                    })
+                    .unwrap_or_else(|| {
+                        let mut context = empty_plugin_context(correlation_id);
+                        context.workspace_id = workspace_id.clone();
+                        context.focused_pane_id = pane_id.clone();
+                        context
+                    })
+            }
         }
     }
 

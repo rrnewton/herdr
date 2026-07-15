@@ -20,6 +20,8 @@ pub enum Subscription {
     WorkspaceCreated {},
     #[serde(rename = "workspace.updated")]
     WorkspaceUpdated {},
+    #[serde(rename = "workspace.metadata_updated")]
+    WorkspaceMetadataUpdated {},
     #[serde(rename = "workspace.renamed")]
     WorkspaceRenamed {},
     #[serde(rename = "workspace.moved")]
@@ -48,6 +50,8 @@ pub enum Subscription {
     PaneCreated {},
     #[serde(rename = "pane.closed")]
     PaneClosed {},
+    #[serde(rename = "pane.updated")]
+    PaneUpdated {},
     #[serde(rename = "pane.focused")]
     PaneFocused {},
     #[serde(rename = "pane.moved")]
@@ -68,7 +72,8 @@ pub enum Subscription {
     },
     #[serde(rename = "pane.agent_status_changed")]
     PaneAgentStatusChanged {
-        pane_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent_status: Option<AgentStatus>,
     },
@@ -76,6 +81,8 @@ pub enum Subscription {
     PaneScrollChanged { pane_id: String },
     #[serde(rename = "layout.updated")]
     LayoutUpdated {},
+    #[serde(rename = "notification.shown")]
+    NotificationShown {},
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -188,6 +195,7 @@ pub enum EventMatch {
 pub enum EventKind {
     WorkspaceCreated,
     WorkspaceUpdated,
+    WorkspaceMetadataUpdated,
     WorkspaceClosed,
     WorkspaceRenamed,
     WorkspaceMoved,
@@ -202,6 +210,7 @@ pub enum EventKind {
     TabFocused,
     PaneCreated,
     PaneClosed,
+    PaneUpdated,
     PaneFocused,
     PaneMoved,
     PaneOutputChanged,
@@ -209,6 +218,7 @@ pub enum EventKind {
     PaneAgentDetected,
     PaneAgentStatusChanged,
     LayoutUpdated,
+    NotificationShown,
 }
 
 impl EventKind {
@@ -216,6 +226,7 @@ impl EventKind {
         match self {
             EventKind::WorkspaceCreated => "workspace.created",
             EventKind::WorkspaceUpdated => "workspace.updated",
+            EventKind::WorkspaceMetadataUpdated => "workspace.metadata_updated",
             EventKind::WorkspaceClosed => "workspace.closed",
             EventKind::WorkspaceRenamed => "workspace.renamed",
             EventKind::WorkspaceMoved => "workspace.moved",
@@ -230,6 +241,7 @@ impl EventKind {
             EventKind::TabFocused => "tab.focused",
             EventKind::PaneCreated => "pane.created",
             EventKind::PaneClosed => "pane.closed",
+            EventKind::PaneUpdated => "pane.updated",
             EventKind::PaneFocused => "pane.focused",
             EventKind::PaneMoved => "pane.moved",
             EventKind::PaneOutputChanged => "pane.output_changed",
@@ -237,6 +249,7 @@ impl EventKind {
             EventKind::PaneAgentDetected => "pane.agent_detected",
             EventKind::PaneAgentStatusChanged => "pane.agent_status_changed",
             EventKind::LayoutUpdated => "layout.updated",
+            EventKind::NotificationShown => "notification.shown",
         }
     }
 }
@@ -245,6 +258,7 @@ impl EventKind {
 pub const KNOWN_EVENT_KINDS: &[EventKind] = &[
     EventKind::WorkspaceCreated,
     EventKind::WorkspaceUpdated,
+    EventKind::WorkspaceMetadataUpdated,
     EventKind::WorkspaceClosed,
     EventKind::WorkspaceRenamed,
     EventKind::WorkspaceMoved,
@@ -259,6 +273,7 @@ pub const KNOWN_EVENT_KINDS: &[EventKind] = &[
     EventKind::TabFocused,
     EventKind::PaneCreated,
     EventKind::PaneClosed,
+    EventKind::PaneUpdated,
     EventKind::PaneFocused,
     EventKind::PaneMoved,
     EventKind::PaneOutputChanged,
@@ -266,6 +281,7 @@ pub const KNOWN_EVENT_KINDS: &[EventKind] = &[
     EventKind::PaneAgentDetected,
     EventKind::PaneAgentStatusChanged,
     EventKind::LayoutUpdated,
+    EventKind::NotificationShown,
 ];
 
 pub const PLUGIN_HOOK_EVENT_KINDS: &[EventKind] = &[
@@ -336,6 +352,8 @@ mod known_event_name_tests {
         let names = plugin_hook_event_names();
         assert!(!names.contains(&"pane.output_changed"));
         assert!(!names.contains(&"layout.updated"));
+        assert!(!names.contains(&"workspace.metadata_updated"));
+        assert!(!names.contains(&"pane.updated"));
         assert!(names.contains(&"pane.moved"));
     }
 }
@@ -385,8 +403,6 @@ pub struct PaneAgentStatusChangedEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub custom_status: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_agent: Option<String>,
@@ -401,6 +417,17 @@ pub struct PaneScrollChangedEvent {
     pub scroll: PaneScrollInfo,
 }
 
+/// The kind of a server notification/toast, the wire form of the TUI's
+/// `ToastKind`. Mirror clients render this to reproduce server toasts (e.g. an
+/// agent finishing) that would otherwise only be visible in the server TUI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationKind {
+    NeedsAttention,
+    Finished,
+    UpdateInstalled,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EventData {
@@ -408,6 +435,9 @@ pub enum EventData {
         workspace: WorkspaceInfo,
     },
     WorkspaceUpdated {
+        workspace: WorkspaceInfo,
+    },
+    WorkspaceMetadataUpdated {
         workspace: WorkspaceInfo,
     },
     WorkspaceClosed {
@@ -472,6 +502,9 @@ pub enum EventData {
         pane_id: String,
         workspace_id: String,
     },
+    PaneUpdated {
+        pane: PaneInfo,
+    },
     PaneFocused {
         pane_id: String,
         workspace_id: String,
@@ -515,12 +548,23 @@ pub enum EventData {
         title: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         display_agent: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        custom_status: Option<String>,
         #[serde(default, skip_serializing_if = "HashMap::is_empty")]
         state_labels: HashMap<String, String>,
     },
     LayoutUpdated {
         layout: super::panes::PaneLayoutSnapshot,
+    },
+    /// A server-side notification/toast was raised (e.g. an agent finished or
+    /// needs attention). Carries the display text plus the optional pane/
+    /// workspace it targets, so a mirror client can show the same toast the
+    /// server TUI does.
+    NotificationShown {
+        kind: NotificationKind,
+        title: String,
+        context: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane_id: Option<String>,
     },
 }

@@ -1,6 +1,8 @@
 //! Input handling — translates crossterm key/mouse events into state mutations.
 
+use bytes::Bytes;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use tracing::warn;
 
 use crate::app::PaneClickState;
 use crate::input::TerminalKey;
@@ -44,6 +46,11 @@ mod settings;
 mod sidebar;
 mod terminal;
 
+#[cfg(unix)]
+pub(crate) use self::navigate::{
+    prefix_indexed_navigation_action, prefix_non_indexed_navigation_action, ActionContext,
+    NavigateAction,
+};
 pub(crate) use self::{
     modal::{
         handle_global_menu_key, handle_keybind_help_key, handle_navigator_key,
@@ -70,6 +77,10 @@ use super::App;
 
 impl App {
     pub(super) async fn handle_key(&mut self, key: TerminalKey) {
+        if self.state.popup_pane.is_some() {
+            self.handle_terminal_key(key).await;
+            return;
+        }
         let key_event = key.as_key_event();
         if modal_paste_target_active(&self.state) && is_modal_paste_shortcut(&key_event) {
             if let Some(text) = crate::platform::read_clipboard_text() {
@@ -80,37 +91,58 @@ impl App {
 
         match self.state.mode {
             Mode::Terminal => self.handle_terminal_key(key).await,
+            _ => self.handle_non_terminal_key(key),
+        }
+    }
+
+    /// Dispatches a key for every interaction mode **except** `Terminal` (whose
+    /// keystroke handling is async and differs between the server app and the
+    /// mirror client). This is the single shared entry point the mirror reuses so
+    /// prefix commands, copy mode, navigate mode, settings, help, the navigator,
+    /// rename/worktree/confirm modals, resize, and context menus all behave
+    /// identically without duplicating per-mode logic. Structural side effects
+    /// route through `dispatch_runtime_mutation`, which the mirror captures.
+    pub(crate) fn handle_non_terminal_key(&mut self, key: TerminalKey) {
+        let key_event = key.as_key_event();
+        match self.state.mode {
+            // Terminal keystrokes are forwarded by the caller (the server app
+            // awaits the PTY; the mirror forwards to the focused mirror runtime).
+            Mode::Terminal => {}
             Mode::Prefix => self.handle_prefix_key(key),
             Mode::Navigate => self.handle_navigate_key(key),
             Mode::Copy => self.handle_copy_mode_key(key),
-            _ => match self.state.mode {
-                Mode::Onboarding => self.handle_onboarding_key(key_event),
-                Mode::ReleaseNotes => self.handle_release_notes_key(key_event),
-                Mode::ProductAnnouncement => self.handle_product_announcement_key(key_event),
-                Mode::Prefix | Mode::Navigate | Mode::Copy => unreachable!(),
-                Mode::RenameWorkspace | Mode::RenameTab | Mode::RenamePane => {
-                    self.handle_rename_key_via_api(key_event)
-                }
-                Mode::NewLinkedWorktree => self.handle_worktree_create_key(key_event),
-                Mode::OpenExistingWorktree => self.handle_worktree_open_key(key_event),
-                Mode::ConfirmRemoveWorktree => self.handle_worktree_remove_key(key_event),
-                Mode::Resize => self.handle_resize_key_via_api(key),
-                Mode::ConfirmClose => self.handle_confirm_close_key_via_api(key_event),
-                Mode::ContextMenu => {
-                    self.handle_context_menu_key_via_api(key_event);
-                }
-                Mode::Settings => self.handle_settings_key(key_event),
-                Mode::GlobalMenu => handle_global_menu_key(&mut self.state, key_event),
-                Mode::KeybindHelp => handle_keybind_help_key(&mut self.state, key_event),
-                Mode::Navigator => {
-                    handle_navigator_key(&mut self.state, &self.terminal_runtimes, key_event)
-                }
-                Mode::Terminal => unreachable!(),
-            },
+            Mode::Onboarding => self.handle_onboarding_key(key_event),
+            Mode::ReleaseNotes => self.handle_release_notes_key(key_event),
+            Mode::ProductAnnouncement => self.handle_product_announcement_key(key_event),
+            Mode::RenameWorkspace | Mode::RenameTab | Mode::RenamePane => {
+                self.handle_rename_key_via_api(key_event)
+            }
+            Mode::NewLinkedWorktree => self.handle_worktree_create_key(key_event),
+            Mode::OpenExistingWorktree => self.handle_worktree_open_key(key_event),
+            Mode::ConfirmRemoveWorktree => self.handle_worktree_remove_key(key_event),
+            Mode::Resize => self.handle_resize_key_via_api(key),
+            Mode::ConfirmClose => self.handle_confirm_close_key_via_api(key_event),
+            Mode::ContextMenu => {
+                self.handle_context_menu_key_via_api(key_event);
+            }
+            Mode::Settings => self.handle_settings_key(key_event),
+            Mode::GlobalMenu => handle_global_menu_key(&mut self.state, key_event),
+            Mode::KeybindHelp => handle_keybind_help_key(&mut self.state, key_event),
+            Mode::Navigator => {
+                handle_navigator_key(&mut self.state, &self.terminal_runtimes, key_event)
+            }
         }
     }
 
     pub(super) async fn handle_paste(&mut self, text: String) {
+        if self.state.popup_pane.is_some() {
+            if let Some(runtime) = self.popup_runtime() {
+                let _ = runtime.send_paste(text).await;
+            } else {
+                self.close_popup_pane();
+            }
+            return;
+        }
         if self.state.mode != Mode::Terminal {
             self.paste_into_active_text_input(&text);
             return;
@@ -239,6 +271,10 @@ impl App {
     }
 
     pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) {
+        if self.state.popup_pane.is_some() {
+            self.handle_popup_mouse(mouse);
+            return;
+        }
         if self.handle_overlay_mouse(mouse) {
             return;
         }
@@ -370,6 +406,62 @@ impl App {
         } else if self.selection_autoscroll_deadline.is_none() {
             self.selection_autoscroll_deadline =
                 Some(std::time::Instant::now() + super::SELECTION_AUTOSCROLL_INTERVAL);
+        }
+    }
+
+    fn handle_popup_mouse(&mut self, mouse: MouseEvent) {
+        let Some((_outer, inner)) =
+            crate::ui::popup_pane_rects(&self.state, self.state.view.terminal_area)
+        else {
+            return;
+        };
+        if mouse.column < inner.x
+            || mouse.column >= inner.x.saturating_add(inner.width)
+            || mouse.row < inner.y
+            || mouse.row >= inner.y.saturating_add(inner.height)
+        {
+            return;
+        }
+        let Some(rt) = self.popup_runtime() else {
+            self.close_popup_pane();
+            return;
+        };
+        let column = mouse.column.saturating_sub(inner.x);
+        let row = mouse.row.saturating_sub(inner.y);
+        let bytes = match mouse.kind {
+            MouseEventKind::ScrollUp
+            | MouseEventKind::ScrollDown
+            | MouseEventKind::ScrollLeft
+            | MouseEventKind::ScrollRight => match rt.wheel_routing() {
+                Some(crate::pane::WheelRouting::MouseReport) => {
+                    rt.encode_mouse_wheel(mouse.kind, column, row, mouse.modifiers)
+                }
+                Some(crate::pane::WheelRouting::AlternateScroll) => {
+                    rt.encode_alternate_scroll(mouse.kind)
+                }
+                Some(crate::pane::WheelRouting::HostScroll) | None => {
+                    let lines_per_notch = self.state.mouse_scroll_lines;
+                    match mouse.kind {
+                        MouseEventKind::ScrollUp => rt.scroll_up(lines_per_notch),
+                        MouseEventKind::ScrollDown => rt.scroll_down(lines_per_notch),
+                        _ => {}
+                    }
+                    return;
+                }
+            },
+            MouseEventKind::Down(_) | MouseEventKind::Up(_) | MouseEventKind::Drag(_) => {
+                rt.encode_mouse_button(mouse.kind, column, row, mouse.modifiers)
+            }
+            MouseEventKind::Moved => {
+                rt.encode_mouse_motion(mouse.kind, column, row, mouse.modifiers)
+            }
+        };
+        let Some(bytes) = bytes else {
+            return;
+        };
+        rt.scroll_reset();
+        if let Err(err) = rt.try_send_bytes(Bytes::from(bytes)) {
+            warn!(err = %err, kind = ?mouse.kind, "failed to forward popup mouse event");
         }
     }
 

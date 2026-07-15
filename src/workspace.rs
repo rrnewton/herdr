@@ -157,6 +157,8 @@ pub struct Workspace {
     pub(crate) cached_git_space: Option<GitSpaceMetadata>,
     /// Explicit Herdr-managed worktree grouping provenance.
     pub worktree_space: Option<WorktreeSpaceMembership>,
+    pub(crate) metadata_tokens: crate::metadata_tokens::MetadataTokens,
+    pub(crate) metadata_token_sequences: HashMap<String, u64>,
     /// Public pane numbers within this workspace. Closed pane numbers are not reused.
     pub public_pane_numbers: HashMap<PaneId, usize>,
     pub(crate) next_public_pane_number: usize,
@@ -216,6 +218,8 @@ impl Workspace {
             cached_git_ahead_behind: None,
             cached_git_space: git_space_metadata(&identity_cwd),
             worktree_space: None,
+            metadata_tokens: crate::metadata_tokens::MetadataTokens::default(),
+            metadata_token_sequences: HashMap::new(),
             public_pane_numbers,
             next_public_pane_number: 2,
             next_public_tab_number: 2,
@@ -397,6 +401,8 @@ impl Workspace {
                 cached_git_ahead_behind: None,
                 cached_git_space: None,
                 worktree_space: None,
+                metadata_tokens: crate::metadata_tokens::MetadataTokens::default(),
+                metadata_token_sequences: HashMap::new(),
                 public_pane_numbers,
                 next_public_pane_number: 2,
                 next_public_tab_number: 2,
@@ -1175,6 +1181,46 @@ pub(crate) struct TakenPane {
     pub workspace_empty: bool,
 }
 
+#[cfg(unix)]
+impl Workspace {
+    /// Builds a workspace for the client-side mirror replica from already-built
+    /// tabs (`design-mirror-tui.md` §2.3). The git `branch` is supplied by the
+    /// server (via `WorkspaceInfo`) so the mirror renders the same branch subtitle
+    /// as the server TUI; the remaining git metadata (ahead/behind, space
+    /// grouping) is left uncached and can be filled later.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_mirror(
+        id: String,
+        custom_name: Option<String>,
+        identity_cwd: PathBuf,
+        branch: Option<String>,
+        tabs: Vec<Tab>,
+        active_tab: usize,
+        public_pane_numbers: HashMap<PaneId, usize>,
+        next_public_pane_number: usize,
+        next_public_tab_number: usize,
+    ) -> Self {
+        Self {
+            id,
+            custom_name,
+            identity_cwd,
+            cached_git_branch: branch,
+            cached_git_ahead_behind: None,
+            cached_git_space: None,
+            worktree_space: None,
+            public_pane_numbers,
+            next_public_pane_number,
+            next_public_tab_number,
+            tabs,
+            active_tab,
+            metadata_tokens: crate::metadata_tokens::MetadataTokens::default(),
+            metadata_token_sequences: HashMap::new(),
+            #[cfg(test)]
+            test_runtimes: HashMap::new(),
+        }
+    }
+}
+
 #[cfg(test)]
 impl Workspace {
     pub(crate) fn test_new(name: &str) -> Self {
@@ -1208,6 +1254,8 @@ impl Workspace {
             cached_git_ahead_behind: None,
             cached_git_space: None,
             worktree_space: None,
+            metadata_tokens: crate::metadata_tokens::MetadataTokens::default(),
+            metadata_token_sequences: HashMap::new(),
             public_pane_numbers,
             next_public_pane_number: 2,
             next_public_tab_number: 2,

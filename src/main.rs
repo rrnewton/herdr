@@ -73,11 +73,13 @@ mod ipc;
 mod kitty_graphics;
 mod layout;
 mod logging;
+mod metadata_tokens;
 mod pane;
 mod persist;
 mod platform;
 mod plugin_command;
 mod plugin_paths;
+mod popup_size;
 mod product_announcements;
 mod protocol;
 mod pty;
@@ -221,11 +223,15 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # Custom commands use the same binding syntax.
 # type = "shell" runs detached in the background.
 # type = "pane" opens a temporary pane and closes it when the command exits.
+# type = "popup" opens a session-modal terminal without changing the tab layout.
+# Popup width and height accept terminal cells or percentages such as "80%".
 # On Windows, command strings run through cmd.exe /d /c.
 # [[keys.command]]
 # key = "prefix+alt+g"
-# type = "pane"
+# type = "popup"
 # command = "lazygit"
+# width = "80%"
+# height = "80%"
 
 # Legacy indexed shortcut config is still parsed for compatibility.
 # Prefer switch_tab, switch_workspace, and focus_agent for new configs.
@@ -303,6 +309,24 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # Agent panel ordering: "spaces" (grouped by space) or "priority" (attention queue).
 # "workspaces" is accepted as an alias for "spaces".
 # agent_panel_sort = "spaces"
+
+# Expanded agent rows. Built-ins are state_icon, state_text, workspace, tab, pane, agent,
+# terminal_title, and terminal_title_stripped.
+# Custom values reported through pane metadata use a $name token.
+# [ui.sidebar.agents]
+# Blank rows between agent entries. Set to 1 to restore the previous spacing.
+# row_gap = 0
+# rows = [["state_icon", "workspace", "tab"], ["agent"]]
+# Optional canonical agent IDs replace the default rows for matching agents.
+# [ui.sidebar.agents.rows_by_agent]
+# claude = [["state_icon", "workspace", "tab"], ["terminal_title_stripped"], ["agent"]]
+
+# Expanded space rows. Built-ins are state_icon, state_text, workspace, branch, and git_status.
+# Custom values reported through workspace metadata use a $name token, for example $jj_status.
+# [ui.sidebar.spaces]
+# Blank rows between space entries. Set to 1 to restore the previous spacing.
+# row_gap = 0
+# rows = [["state_icon", "workspace"], ["branch", "git_status"]]
 
 # Accent color for highlights, borders, and navigation UI.
 # Accepts: hex (#89b4fa), named colors (cyan, blue, magenta), or rgb(r,g,b)
@@ -501,6 +525,7 @@ fn main() -> io::Result<()> {
         println!("Usage: herdr [options]");
         println!("       herdr --session <name> [options]");
         println!("       herdr --remote <ssh-target> [--session <name>]");
+        println!("       herdr mirror <host> [ssh args ...]");
         println!("       herdr session attach <name>");
         println!("       herdr completion zsh");
         println!("       herdr update [--handoff]");
@@ -524,6 +549,10 @@ fn main() -> io::Result<()> {
         println!("Common commands:");
         for (command, description) in [
             ("herdr", "Launch or attach to the persistent session"),
+            (
+                "herdr mirror <host>",
+                "Mirror a remote host's session over SSH in one command",
+            ),
             (
                 "herdr status [server|client]",
                 "Show local client and running server status",
@@ -625,6 +654,7 @@ fn main() -> io::Result<()> {
     // Reject unknown flags
     let known_flags = [
         "--no-session",
+        "--mirror",
         "--session",
         "--remote",
         "--remote-keybindings",
@@ -679,6 +709,22 @@ fn main() -> io::Result<()> {
     exit_if_nested_disabled(&loaded_config.config);
 
     let no_session = args.iter().any(|a| a == "--no-session");
+
+    // Full mirror TUI: a client-rendered view of the running session that is
+    // latency-immune for scrollback/search/navigation (design-mirror-tui.md §2.5).
+    // Selected with `--mirror` or `HERDR_MIRROR=1`; not compatible with
+    // --no-session (there is no server to mirror).
+    let mirror_requested = args.iter().any(|a| a == "--mirror")
+        || std::env::var("HERDR_MIRROR").is_ok_and(|v| v == "1");
+    if mirror_requested && !no_session {
+        let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
+        let session = session::active_name();
+        if let Err(err) = client::run_mirror_session(session, cols, rows) {
+            eprintln!("herdr --mirror: {err}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
 
     // Auto-detect launch: when --no-session is NOT set, use server/client mode.
     // Check if a server is running, spawn one if needed, then attach as client.

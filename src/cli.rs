@@ -14,6 +14,7 @@ mod agent;
 mod api;
 mod completion;
 mod integration;
+mod mirror;
 mod notification;
 mod pane;
 mod plugin;
@@ -29,6 +30,18 @@ const TERMINAL_SESSION_OBSERVE_USAGE: &str =
     "usage: herdr terminal session observe <target> [--cols N] [--rows N]";
 const TERMINAL_SESSION_CONTROL_USAGE: &str =
     "usage: herdr terminal session control <target> [--takeover] [--cols N] [--rows N]";
+const TERMINAL_SESSION_MIRROR_USAGE: &str =
+    "usage: herdr terminal session mirror <target> [--json] [--resume-from SEQ] [--cols N] [--rows N]";
+
+pub(crate) fn parse_token_assignment(raw: &str) -> Result<(String, Option<String>), String> {
+    let Some((key, value)) = raw.split_once('=') else {
+        return Err("token must use NAME=VALUE".into());
+    };
+    if key.is_empty() {
+        return Err("token name must not be empty".into());
+    }
+    Ok((key.to_string(), Some(value.to_string())))
+}
 
 pub(crate) fn parse_env_assignment(raw: &str) -> Result<(String, String), String> {
     let Some((key, value)) = raw.split_once('=') else {
@@ -71,6 +84,7 @@ pub fn maybe_run(args: &[String]) -> std::io::Result<CommandOutcome> {
         "notification" => notification::run_notification_command(&args[2..])?,
         "agent" => agent::run_agent_command(&args[2..])?,
         "terminal" => run_terminal_command(&args[2..])?,
+        "mirror" => mirror::run_mirror_command(&args[2..])?,
         "pane" => pane::run_pane_command(&args[2..])?,
         "plugin" => plugin::run_plugin_command(&args[2..])?,
         "wait" => run_wait_command(&args[2..])?,
@@ -519,14 +533,17 @@ fn terminal_session(args: &[String]) -> std::io::Result<i32> {
     match args.first().map(|arg| arg.as_str()) {
         Some("control") => terminal_session_control(&args[1..]),
         Some("observe") => terminal_session_observe(&args[1..]),
+        Some("mirror") => terminal_session_mirror(&args[1..]),
         Some("help" | "--help" | "-h") => {
             eprintln!("{TERMINAL_SESSION_CONTROL_USAGE}");
             eprintln!("{TERMINAL_SESSION_OBSERVE_USAGE}");
+            eprintln!("{TERMINAL_SESSION_MIRROR_USAGE}");
             Ok(0)
         }
         _ => {
             eprintln!("{TERMINAL_SESSION_CONTROL_USAGE}");
             eprintln!("{TERMINAL_SESSION_OBSERVE_USAGE}");
+            eprintln!("{TERMINAL_SESSION_MIRROR_USAGE}");
             Ok(2)
         }
     }
@@ -564,6 +581,78 @@ fn terminal_session_observe(args: &[String]) -> std::io::Result<i32> {
     };
 
     crate::client::run_terminal_session_observe(options.target, options.cols, options.rows)?;
+    Ok(0)
+}
+
+fn terminal_session_mirror(args: &[String]) -> std::io::Result<i32> {
+    if matches!(
+        args.first().map(|arg| arg.as_str()),
+        Some("help" | "--help" | "-h")
+    ) {
+        eprintln!("{TERMINAL_SESSION_MIRROR_USAGE}");
+        return Ok(0);
+    }
+    let Some(target) = args.first() else {
+        eprintln!("{TERMINAL_SESSION_MIRROR_USAGE}");
+        return Ok(2);
+    };
+
+    let mut cols = 120;
+    let mut rows = 40;
+    let mut resume_from = None;
+    let mut json = false;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--json" => {
+                json = true;
+                i += 1;
+            }
+            "--cols" => {
+                let Some(value) = args.get(i + 1) else {
+                    eprintln!("{TERMINAL_SESSION_MIRROR_USAGE}");
+                    return Ok(2);
+                };
+                cols = parse_terminal_dimension(value, "--cols")?;
+                i += 2;
+            }
+            "--rows" => {
+                let Some(value) = args.get(i + 1) else {
+                    eprintln!("{TERMINAL_SESSION_MIRROR_USAGE}");
+                    return Ok(2);
+                };
+                rows = parse_terminal_dimension(value, "--rows")?;
+                i += 2;
+            }
+            "--resume-from" => {
+                let Some(value) = args.get(i + 1) else {
+                    eprintln!("{TERMINAL_SESSION_MIRROR_USAGE}");
+                    return Ok(2);
+                };
+                let Ok(seq) = value.parse::<u64>() else {
+                    eprintln!("--resume-from must be a non-negative integer");
+                    return Ok(2);
+                };
+                resume_from = Some(seq);
+                i += 2;
+            }
+            "help" | "--help" | "-h" => {
+                eprintln!("{TERMINAL_SESSION_MIRROR_USAGE}");
+                return Ok(0);
+            }
+            other => {
+                eprintln!("unknown terminal session mirror option: {other}");
+                eprintln!("{TERMINAL_SESSION_MIRROR_USAGE}");
+                return Ok(2);
+            }
+        }
+    }
+
+    if json {
+        crate::client::run_terminal_session_mirror_json(target.clone(), cols, rows, resume_from)?;
+    } else {
+        crate::client::run_terminal_session_mirror(target.clone(), cols, rows, resume_from)?;
+    }
     Ok(0)
 }
 
@@ -881,7 +970,6 @@ fn wait_for_agent_status_change(
                 agent,
                 title,
                 display_agent,
-                custom_status,
                 state_labels,
             } = event.data
             else {
@@ -895,7 +983,6 @@ fn wait_for_agent_status_change(
                         workspace_id,
                         agent_status,
                         agent,
-                        custom_status,
                         title,
                         display_agent,
                         state_labels,
