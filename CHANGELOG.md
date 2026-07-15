@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## [0.7.4] - 2026-07-15
+
 ### Added
 - Added session-modal popup floating terminal panes for `type = "popup"` custom command keybindings and plugin panes, with optional cell or percentage sizing and no changes to the tiled tab layout. (#1125)
 - Added `ui.copy_on_select` to disable automatic clipboard copying after mouse selection while keeping the selection visible.
