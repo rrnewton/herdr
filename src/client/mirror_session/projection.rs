@@ -409,10 +409,17 @@ pub(super) fn project_pane_metadata(terminal: &mut TerminalState, info: &PaneInf
         label,
         agent,
         title,
+        // The mirror's own replicated terminal parses OSC title sequences, so the
+        // server's raw/stripped terminal title is a runtime fact, not a render
+        // input the projection reconstructs.
+        terminal_title: _,
+        terminal_title_stripped: _,
         display_agent,
         agent_status,
-        custom_status,
         state_labels,
+        // Pane metadata tokens are a sidebar display feature the mirror does not
+        // project yet.
+        tokens: _,
         // Runtime facts, not render inputs the projection reconstructs.
         agent_session: _,
         scroll: _,
@@ -426,26 +433,20 @@ pub(super) fn project_pane_metadata(terminal: &mut TerminalState, info: &PaneInf
         terminal.set_agent_name(agent.clone());
     }
 
-    // Reconstruct the effective presentation (title / display agent / custom
-    // status / state labels) the server computed so the sidebar agent panel and
-    // pane border labels match. `set_agent_metadata` recomputes `state` from
+    // Reconstruct the effective presentation (title / display agent / state
+    // labels) the server computed so the sidebar agent panel and pane border
+    // labels match. `set_agent_metadata` recomputes `state` from
     // `fallback_state`, so it must run before we pin the agent state below.
-    if title.is_some()
-        || display_agent.is_some()
-        || custom_status.is_some()
-        || !state_labels.is_empty()
-    {
+    if title.is_some() || display_agent.is_some() || !state_labels.is_empty() {
         terminal.set_agent_metadata(AgentMetadataReport {
             source: MIRROR_METADATA_SOURCE.to_string(),
             agent_label: None,
             applies_to_source: None,
             title: title.clone(),
             display_agent: display_agent.clone(),
-            custom_status: custom_status.clone(),
             state_labels: state_labels.clone(),
             clear_title: false,
             clear_display_agent: false,
-            clear_custom_status: false,
             clear_state_labels: false,
             ttl: None,
             seq: None,
@@ -482,6 +483,9 @@ pub(super) fn project_workspace_metadata(info: &WorkspaceInfo) -> ProjectedWorks
         active_tab_id: _,
         // Aggregated by the renderer from each pane's projected agent state.
         agent_status: _,
+        // Workspace metadata tokens are a sidebar display feature the mirror does
+        // not project yet.
+        tokens: _,
         branch,
         git_ahead,
         git_behind,
@@ -535,10 +539,12 @@ mod tests {
             label: None,
             agent: None,
             title: None,
+            terminal_title: None,
+            terminal_title_stripped: None,
             display_agent: None,
             agent_status,
-            custom_status: None,
             state_labels: HashMap::new(),
+            tokens: HashMap::new(),
             agent_session: None,
             scroll: None,
             revision: 0,
@@ -558,7 +564,6 @@ mod tests {
             agent: Some("pi".into()),
             title: Some("running tests".into()),
             display_agent: Some("Pi".into()),
-            custom_status: Some("87%".into()),
             state_labels: state_labels.clone(),
             ..pane_info(AgentStatus::Working)
         };
@@ -574,7 +579,6 @@ mod tests {
         let presentation = terminal.effective_presentation();
         assert_eq!(presentation.title.as_deref(), Some("running tests"));
         assert_eq!(presentation.display_agent.as_deref(), Some("Pi"));
-        assert_eq!(presentation.custom_status.as_deref(), Some("87%"));
         assert_eq!(presentation.state_labels, state_labels);
     }
 
@@ -602,7 +606,6 @@ mod tests {
         assert_eq!(terminal.state, AgentState::Unknown);
         let presentation = terminal.effective_presentation();
         assert_eq!(presentation.title, None);
-        assert_eq!(presentation.custom_status, None);
         assert!(presentation.state_labels.is_empty());
     }
 
@@ -616,6 +619,7 @@ mod tests {
             tab_count: 1,
             active_tab_id: "tab1".into(),
             agent_status: AgentStatus::Unknown,
+            tokens: HashMap::new(),
             branch: Some("feat/x".into()),
             git_ahead: Some(2),
             git_behind: Some(1),

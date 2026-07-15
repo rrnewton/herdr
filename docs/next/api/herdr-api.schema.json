@@ -779,6 +779,16 @@
             "agent_status": {
               "$ref": "#/schemas/event/$defs/AgentStatus"
             },
+            "cols": {
+              "description": "Columns the pane's terminal runtime is currently sized to, if known.",
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "cwd": {
               "type": [
                 "string",
@@ -813,6 +823,16 @@
               "format": "uint64",
               "minimum": 0,
               "type": "integer"
+            },
+            "rows": {
+              "description": "Rows the pane's terminal runtime is currently sized to, if known.",
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
             },
             "scroll": {
               "anyOf": [
@@ -3646,7 +3666,10 @@
                   ]
                 },
                 "pane_id": {
-                  "type": "string"
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
                 "type": {
                   "const": "pane.agent_status_changed",
@@ -3654,8 +3677,7 @@
                 }
               },
               "required": [
-                "type",
-                "pane_id"
+                "type"
               ],
               "type": "object"
             },
@@ -6928,6 +6950,16 @@
             "agent_status": {
               "$ref": "#/schemas/success_response/$defs/AgentStatus"
             },
+            "cols": {
+              "description": "Columns the pane's terminal runtime is currently sized to, if known.",
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "cwd": {
               "type": [
                 "string",
@@ -6962,6 +6994,16 @@
               "format": "uint64",
               "minimum": 0,
               "type": "integer"
+            },
+            "rows": {
+              "description": "Rows the pane's terminal runtime is currently sized to, if known.",
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
             },
             "scroll": {
               "anyOf": [

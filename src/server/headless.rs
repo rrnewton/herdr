@@ -3143,11 +3143,11 @@ impl HeadlessServer {
                     len = events.len(),
                     "client input events received"
                 );
+                // Writable mirror clients forward their structured input straight to
+                // the terminal. TerminalAttach clients instead flow through
+                // `handle_client_input_events` (focus/promotion handling), matching
+                // the non-mirror server so structured focus events stay non-suppressing.
                 let direct_terminal = match self.clients.get(&client_id) {
-                    Some(ClientConnection {
-                        mode: ClientConnectionMode::TerminalAttach { terminal_id },
-                        ..
-                    }) => Some(terminal_id.clone()),
                     Some(ClientConnection {
                         mode: ClientConnectionMode::TerminalMirror { terminal_id },
                         mirror_writable: true,

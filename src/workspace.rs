@@ -1213,6 +1213,8 @@ impl Workspace {
             next_public_tab_number,
             tabs,
             active_tab,
+            metadata_tokens: crate::metadata_tokens::MetadataTokens::default(),
+            metadata_token_sequences: HashMap::new(),
             #[cfg(test)]
             test_runtimes: HashMap::new(),
         }

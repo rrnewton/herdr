@@ -265,7 +265,6 @@ fn subscription_event_to_event(envelope: SubscriptionEventEnvelope) -> Option<Ev
                 agent: event.agent,
                 title: event.title,
                 display_agent: event.display_agent,
-                custom_status: event.custom_status,
                 state_labels: event.state_labels,
             },
         }),

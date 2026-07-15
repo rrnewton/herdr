@@ -277,7 +277,6 @@ impl SessionReplica {
                 agent,
                 title,
                 display_agent,
-                custom_status,
                 state_labels,
                 ..
             } => {
@@ -286,7 +285,6 @@ impl SessionReplica {
                     pane.agent = agent;
                     pane.title = title;
                     pane.display_agent = display_agent;
-                    pane.custom_status = custom_status;
                     pane.state_labels = state_labels;
                 }
                 vec![ReplicaChange::Structural]
@@ -309,6 +307,21 @@ impl SessionReplica {
                 workspace_id,
                 pane_id,
             }],
+            // Workspace metadata (display tokens) changed. Keep the replica's
+            // `WorkspaceInfo` current so branch/worktree projection stays
+            // consistent; the mirror does not render workspace tokens itself.
+            EventData::WorkspaceMetadataUpdated { workspace } => {
+                self.upsert_workspace(workspace);
+                vec![ReplicaChange::Structural]
+            }
+            // A full pane snapshot update. Refresh the stored `PaneInfo` so the
+            // next projection picks up the new presentation.
+            EventData::PaneUpdated { pane } => {
+                if let Some(existing) = self.panes.get_mut(&pane.pane_id) {
+                    *existing = pane;
+                }
+                vec![ReplicaChange::Structural]
+            }
             // Output revisions carry no structural change; the data plane feeds
             // content directly into each terminal's mirror runtime.
             EventData::PaneOutputChanged { .. } => Vec::new(),
@@ -500,10 +513,12 @@ mod tests {
             label: None,
             agent: None,
             title: None,
+            terminal_title: None,
+            terminal_title_stripped: None,
             display_agent: None,
             agent_status: AgentStatus::Unknown,
-            custom_status: None,
             state_labels: HashMap::new(),
+            tokens: HashMap::new(),
             agent_session: None,
             scroll: None,
             revision: 0,
@@ -520,6 +535,7 @@ mod tests {
             tab_count: 1,
             active_tab_id: active_tab_id.into(),
             agent_status: AgentStatus::Unknown,
+            tokens: HashMap::new(),
             branch: None,
             git_ahead: None,
             git_behind: None,
@@ -711,7 +727,6 @@ mod tests {
                 agent: Some("pi".into()),
                 title: Some("building".into()),
                 display_agent: None,
-                custom_status: None,
                 state_labels: HashMap::new(),
             },
         ));

@@ -132,6 +132,7 @@ impl TerminalRuntime {
                     keyboard_protocol_flags: 0,
                     keyboard_protocol_ansi: None,
                     input_state: None,
+                    terminal_title: None,
                     initial_history_ansi: None,
                 }
             }
@@ -337,7 +338,11 @@ impl TerminalRuntime {
 
     #[cfg(test)]
     pub(crate) fn agent_detection_enabled_for_test(&self) -> bool {
-        self.0.agent_detection_enabled_for_test()
+        match self {
+            Self::Pty(rt) => rt.agent_detection_enabled_for_test(),
+            #[cfg(unix)]
+            Self::Mirror(_) => false,
+        }
     }
 
     pub fn set_full_lifecycle_authority_active(&self, active: bool) {
@@ -526,7 +531,11 @@ impl TerminalRuntime {
     }
 
     pub fn terminal_title(&self) -> Option<String> {
-        self.0.terminal_title()
+        match self {
+            Self::Pty(rt) => rt.terminal_title(),
+            #[cfg(unix)]
+            Self::Mirror(_) => None,
+        }
     }
 
     pub fn agent_osc_title(&self) -> String {
@@ -693,7 +702,14 @@ impl TerminalRuntime {
     }
 
     pub fn try_send_paste(&self, text: String) -> Result<(), mpsc::error::TrySendError<Bytes>> {
-        self.0.try_send_paste(text)
+        match self {
+            Self::Pty(rt) => rt.try_send_paste(text),
+            #[cfg(unix)]
+            Self::Mirror(_) => {
+                debug_assert!(false, "try_send_paste called on a mirror runtime");
+                Ok(())
+            }
+        }
     }
 
     pub fn try_send_focus_event(&self, event: crate::ghostty::FocusEvent) -> bool {
