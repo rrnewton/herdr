@@ -113,6 +113,13 @@ Raw socket method names use dot notation:
 
 `agent.wait` is server-owned and event-driven. It pins the resolved pane occupant so a replacement cannot satisfy the wait. `agent.prompt` accepts an optional `wait` object with `until` and `timeout_ms`; this submits the prompt and starts the wait in one request, avoiding a race between separate calls.
 
+`pane.send_text`, `pane.send_keys`, `agent.prompt`, and `agent.send_keys` accept an optional `expect` object for conditional input. Today it has one field, `terminal_id`: the terminal id the target pane must currently host, as reported by `pane.get`, `pane.list`, and `agent.get`. The server checks it after resolving the target and before writing any byte, in the same request, so a pane that was replaced since the client looked (for example by a restart that restored a pane under the same id) cannot receive the input. On a mismatch the request fails with error code `expectation_failed`, whose message names the expected and actual terminal ids, and nothing is written; for `agent.prompt` with `wait`, the check applies to the submission. An `expect` object with no fields fails with `invalid_expectation`, and unknown `expect` fields are rejected. The check does not detect a program exiting or exec-ing a different program inside the same terminal. Omitting `expect` keeps the unconditional behavior. Servers that support `expect` list `input-expect` in the `features` array of the `ping` response; check for it before sending `expect`, because older servers ignore unknown params instead of rejecting them.
+
+```json
+{"id":"req_1","method":"pane.send_text","params":{"pane_id":"w1:p1","text":"make test","expect":{"terminal_id":"term_1a2b3c"}}}
+{"id":"req_1","error":{"code":"expectation_failed","message":"input expectation failed for w1:p1: expected terminal term_1a2b3c, actual terminal term_4d5e6f; nothing was written"}}
+```
+
 `workspace.move_block` atomically moves the ordered `workspace_ids` before `before_workspace_id`; omit the anchor to move the block to the end. The ids must be unique and the anchor cannot be part of the block. The response contains the authoritative ordered workspace list.
 
 `session.snapshot` returns a one-time bootstrap snapshot for clients that keep
@@ -885,3 +892,5 @@ Errors look like this:
 Herdr has a protocol version for client/server compatibility. Protocol changes are reviewed with release compatibility in mind.
 
 Check the server protocol with `ping` or `herdr status` before depending on new behavior. Handle unknown fields gracefully.
+
+`ping` also returns a `features` array naming additive API features the server implements, for example `"features":["input-expect"]`; `herdr status server` prints the same list as `capabilities: input-expect`. Gate optional request fields on these names rather than on the protocol number, because request params do not reject unknown fields.

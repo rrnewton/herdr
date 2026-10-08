@@ -326,6 +326,7 @@ fn handle_request(
                 version: crate::build_info::version(),
                 protocol: crate::protocol::PROTOCOL_VERSION,
                 capabilities,
+                features: crate::api::schema::server_features(),
             },
         })
         .unwrap_or_else(|_| {
@@ -1014,6 +1015,46 @@ mod tests {
         let parsed: SuccessResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(parsed.id, "req_1");
         assert!(matches!(parsed.result, ResponseResult::Pong { .. }));
+    }
+
+    #[test]
+    fn ping_advertises_input_expect_feature_with_and_without_capabilities() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        for capabilities in [
+            Some(ServerCapabilities {
+                live_handoff: true,
+                detached_server_daemon: false,
+            }),
+            None,
+        ] {
+            let response = handle_request(
+                Request {
+                    id: "req_features".into(),
+                    method: Method::Ping(crate::api::schema::PingParams::default()),
+                },
+                &tx,
+                capabilities,
+                None,
+            );
+
+            let raw: serde_json::Value = serde_json::from_str(&response).unwrap();
+            assert_eq!(
+                raw["result"]["features"],
+                serde_json::json!(["input-expect"])
+            );
+            let parsed: SuccessResponse = serde_json::from_str(&response).unwrap();
+            let ResponseResult::Pong {
+                protocol, features, ..
+            } = parsed.result
+            else {
+                panic!("expected pong");
+            };
+            assert_eq!(protocol, crate::protocol::PROTOCOL_VERSION);
+            assert_eq!(
+                features,
+                vec![crate::api::schema::SERVER_FEATURE_INPUT_EXPECT.to_string()]
+            );
+        }
     }
 
     #[test]

@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 mod agent_view;
 mod agents;
 mod env;
+mod input_expect;
 mod integrations;
 mod layouts;
 mod pane_graphics;

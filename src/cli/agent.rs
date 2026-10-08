@@ -642,22 +642,58 @@ fn agent_rename(args: &[String]) -> std::io::Result<i32> {
     })?)
 }
 
+const AGENT_PROMPT_USAGE: &str = "usage: herdr agent prompt [--expect-terminal TERMINAL_ID] <target> <text> [--wait] [--until STATUS]... [--timeout MS]";
+const AGENT_SEND_KEYS_USAGE: &str =
+    "usage: herdr agent send-keys [--expect-terminal TERMINAL_ID] <target> <key> [key ...]";
+
 fn agent_prompt(args: &[String]) -> std::io::Result<i32> {
+    let params = match parse_agent_prompt_args(args) {
+        Ok(params) => params,
+        Err(exit_code) => return Ok(exit_code),
+    };
+    let response = super::send_request(&Request {
+        id: "cli:agent:prompt".into(),
+        method: Method::AgentPrompt(params),
+    })?;
+    super::print_response(&response)
+}
+
+/// Parse `agent prompt` arguments. `--expect-terminal` is accepted before
+/// the positionals or among the trailing options; `<text>` is always the
+/// second positional and is taken literally even when it starts with `--`.
+fn parse_agent_prompt_args(args: &[String]) -> Result<AgentPromptParams, i32> {
+    let (mut expect, args) = super::split_leading_expect_terminal(args).map_err(|err| {
+        eprintln!("{err}");
+        2
+    })?;
     let Some(target) = args.first() else {
-        eprintln!(
-            "usage: herdr agent prompt <target> <text> [--wait] [--until STATUS]... [--timeout MS]"
-        );
-        return Ok(2);
+        eprintln!("{AGENT_PROMPT_USAGE}");
+        return Err(2);
     };
     let Some(text) = args.get(1) else {
         eprintln!("agent prompt requires text");
-        return Ok(2);
+        return Err(2);
     };
     let mut wait = false;
     let mut until = Vec::new();
     let mut timeout_ms = None;
     let mut index = 2;
     while index < args.len() {
+        if let Some(parsed) = super::parse_expect_terminal_at(args, index) {
+            let (terminal_id, consumed) = parsed.map_err(|err| {
+                eprintln!("{err}");
+                2
+            })?;
+            if expect.is_some() {
+                eprintln!("{} may only be given once", super::EXPECT_TERMINAL_FLAG);
+                return Err(2);
+            }
+            expect = Some(crate::api::schema::InputExpectation {
+                terminal_id: Some(terminal_id),
+            });
+            index += consumed;
+            continue;
+        }
         match args[index].as_str() {
             "--wait" => {
                 wait = true;
@@ -666,13 +702,13 @@ fn agent_prompt(args: &[String]) -> std::io::Result<i32> {
             "--until" => {
                 let Some(value) = args.get(index + 1) else {
                     eprintln!("--until requires at least one status");
-                    return Ok(2);
+                    return Err(2);
                 };
                 let status = match super::parse_agent_status(value) {
                     Ok(status) => status,
                     Err(err) => {
                         eprintln!("{err}");
-                        return Ok(2);
+                        return Err(2);
                     }
                 };
                 until.push(status);
@@ -681,52 +717,58 @@ fn agent_prompt(args: &[String]) -> std::io::Result<i32> {
             "--timeout" => {
                 let Some(value) = args.get(index + 1) else {
                     eprintln!("missing value for --timeout");
-                    return Ok(2);
+                    return Err(2);
                 };
-                timeout_ms = match parse_timeout(value) {
-                    Ok(timeout_ms) => Some(timeout_ms),
-                    Err(exit_code) => return Ok(exit_code),
-                };
+                timeout_ms = Some(parse_timeout(value)?);
                 index += 2;
             }
             option => {
                 eprintln!("unknown option: {option}");
-                return Ok(2);
+                return Err(2);
             }
         }
     }
     if !until.is_empty() && !wait {
         eprintln!("--until requires --wait");
-        return Ok(2);
+        return Err(2);
     }
     if timeout_ms.is_some() && !wait {
         eprintln!("--timeout requires --wait");
-        return Ok(2);
+        return Err(2);
     }
-    let response = super::send_request(&Request {
-        id: "cli:agent:prompt".into(),
-        method: Method::AgentPrompt(AgentPromptParams {
-            target: target.clone(),
-            text: text.clone(),
-            wait: wait.then_some(AgentPromptWaitOptions { until, timeout_ms }),
-        }),
-    })?;
-    super::print_response(&response)
+    Ok(AgentPromptParams {
+        target: target.clone(),
+        text: text.clone(),
+        wait: wait.then_some(AgentPromptWaitOptions { until, timeout_ms }),
+        expect,
+    })
 }
 
 fn agent_send_keys(args: &[String]) -> std::io::Result<i32> {
-    if args.len() < 2 {
-        eprintln!("usage: herdr agent send-keys <target> <key> [key ...]");
-        return Ok(2);
-    }
+    let params = match parse_agent_send_keys_args(args) {
+        Ok(params) => params,
+        Err(err) => {
+            eprintln!("{err}");
+            return Ok(2);
+        }
+    };
 
     super::print_response(&super::send_request(&Request {
         id: "cli:agent:send-keys".into(),
-        method: Method::AgentSendKeys(AgentSendKeysParams {
-            target: args[0].clone(),
-            keys: args[1..].to_vec(),
-        }),
+        method: Method::AgentSendKeys(params),
     })?)
+}
+
+fn parse_agent_send_keys_args(args: &[String]) -> Result<AgentSendKeysParams, String> {
+    let (expect, rest) = super::split_leading_expect_terminal(args)?;
+    if rest.len() < 2 {
+        return Err(AGENT_SEND_KEYS_USAGE.to_string());
+    }
+    Ok(AgentSendKeysParams {
+        target: rest[0].clone(),
+        keys: rest[1..].to_vec(),
+        expect,
+    })
 }
 
 fn agent_read(args: &[String]) -> std::io::Result<i32> {
@@ -798,8 +840,9 @@ fn print_agent_help() {
     eprintln!("  herdr agent list");
     eprintln!("  herdr agent get <target>");
     eprintln!("  herdr agent read <target> [--source visible|recent|recent-unwrapped|detection] [--lines N] [--format text|ansi] [--ansi]");
-    eprintln!("  herdr agent send-keys <target> <key> [key ...]");
-    eprintln!("  herdr agent prompt <target> <text> [--wait] [--until STATUS]... [--timeout MS]");
+    eprintln!("  herdr agent send-keys [--expect-terminal TERMINAL_ID] <target> <key> [key ...]");
+    eprintln!("  herdr agent prompt [--expect-terminal TERMINAL_ID] <target> <text> [--wait] [--until STATUS]... [--timeout MS]");
+    eprintln!("  --expect-terminal refuses the input with expectation_failed, writing nothing, unless the target pane hosts that terminal id");
     eprintln!("  herdr agent rename <target> <name>|--clear");
     eprintln!("  herdr agent focus <target>");
     eprintln!("  herdr agent wait <target> [--until STATUS]... [--timeout MS]");
@@ -820,4 +863,112 @@ fn parse_timeout(value: &str) -> Result<u64, i32> {
         eprintln!("{err}");
         2
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    fn expect_terminal(terminal_id: &str) -> Option<crate::api::schema::InputExpectation> {
+        Some(crate::api::schema::InputExpectation {
+            terminal_id: Some(terminal_id.into()),
+        })
+    }
+
+    #[test]
+    fn parse_agent_prompt_args_without_expect_is_unchanged() {
+        let params = parse_agent_prompt_args(&args(&["reviewer", "hello", "--wait"])).unwrap();
+        assert_eq!(params.target, "reviewer");
+        assert_eq!(params.text, "hello");
+        assert!(params.wait.is_some());
+        assert_eq!(params.expect, None);
+    }
+
+    #[test]
+    fn parse_agent_prompt_args_keeps_dash_dash_text_literal_with_leading_expect() {
+        let params = parse_agent_prompt_args(&args(&[
+            "--expect-terminal",
+            "term_abc",
+            "reviewer",
+            "--wait --until idle",
+        ]))
+        .unwrap();
+        assert_eq!(params.target, "reviewer");
+        assert_eq!(params.text, "--wait --until idle");
+        assert_eq!(params.wait, None);
+        assert_eq!(params.expect, expect_terminal("term_abc"));
+
+        let params = parse_agent_prompt_args(&args(&[
+            "--expect-terminal",
+            "term_abc",
+            "reviewer",
+            "--expect-terminal",
+        ]))
+        .unwrap();
+        assert_eq!(params.text, "--expect-terminal");
+        assert_eq!(params.expect, expect_terminal("term_abc"));
+    }
+
+    #[test]
+    fn parse_agent_prompt_args_accepts_trailing_expect_terminal() {
+        let params = parse_agent_prompt_args(&args(&[
+            "reviewer",
+            "hello",
+            "--wait",
+            "--expect-terminal=term_abc",
+            "--timeout",
+            "5000",
+        ]))
+        .unwrap();
+        assert_eq!(params.text, "hello");
+        assert_eq!(params.expect, expect_terminal("term_abc"));
+        assert_eq!(params.wait.unwrap().timeout_ms, Some(5000));
+    }
+
+    #[test]
+    fn parse_agent_prompt_args_rejects_duplicate_or_missing_expect_terminal() {
+        assert_eq!(
+            parse_agent_prompt_args(&args(&[
+                "--expect-terminal",
+                "term_a",
+                "reviewer",
+                "hello",
+                "--expect-terminal",
+                "term_b",
+            ])),
+            Err(2)
+        );
+        assert_eq!(
+            parse_agent_prompt_args(&args(&["reviewer", "hello", "--expect-terminal"])),
+            Err(2)
+        );
+        assert_eq!(
+            parse_agent_prompt_args(&args(&["--expect-terminal", "term_a"])),
+            Err(2)
+        );
+    }
+
+    #[test]
+    fn parse_agent_send_keys_args_accepts_leading_expect_terminal() {
+        let params = parse_agent_send_keys_args(&args(&[
+            "--expect-terminal",
+            "term_abc",
+            "reviewer",
+            "esc",
+        ]))
+        .unwrap();
+        assert_eq!(params.target, "reviewer");
+        assert_eq!(params.keys, vec!["esc".to_string()]);
+        assert_eq!(params.expect, expect_terminal("term_abc"));
+
+        let params = parse_agent_send_keys_args(&args(&["reviewer", "esc"])).unwrap();
+        assert_eq!(params.expect, None);
+        assert!(
+            parse_agent_send_keys_args(&args(&["--expect-terminal", "t", "reviewer"])).is_err()
+        );
+    }
 }

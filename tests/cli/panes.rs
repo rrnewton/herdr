@@ -566,3 +566,137 @@ fn pane_shell_gets_herdr_socket_and_pane_env() {
 
     cleanup_spawned_herdr(herdr, base);
 }
+
+#[test]
+fn pane_send_with_expect_terminal_refuses_stale_terminal_and_writes_nothing() {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+
+    let herdr = spawn_herdr(&config_home, &runtime_dir, &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+
+    let created = run_cli_json(
+        &socket_path,
+        &[
+            "workspace",
+            "create",
+            "--cwd",
+            base.to_str().expect("test path should be utf-8"),
+        ],
+    );
+    let pane_id = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .expect("workspace create should return root pane id")
+        .to_string();
+    let terminal_id = created["result"]["root_pane"]["terminal_id"]
+        .as_str()
+        .expect("workspace create should return root terminal id")
+        .to_string();
+
+    // A stale terminal id is refused: nonzero exit, error JSON on stderr,
+    // and the text (which itself starts with `--`) never reaches the pane.
+    let refused = run_cli(
+        &socket_path,
+        &[
+            "pane",
+            "send-text",
+            "--expect-terminal",
+            "term_stale",
+            &pane_id,
+            "--REFUSED_MARKER\n",
+        ],
+    );
+    assert_eq!(refused.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains(r#""code":"expectation_failed""#),
+        "stderr: {stderr}"
+    );
+    assert!(stderr.contains("term_stale"), "stderr: {stderr}");
+    assert!(stderr.contains(&terminal_id), "stderr: {stderr}");
+
+    let refused_keys = run_cli(
+        &socket_path,
+        &[
+            "pane",
+            "send-keys",
+            "--expect-terminal=term_stale",
+            &pane_id,
+            "enter",
+        ],
+    );
+    assert_eq!(refused_keys.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&refused_keys.stderr).contains(r#""code":"expectation_failed""#)
+    );
+
+    // The current terminal id is accepted.
+    let accepted = run_cli(
+        &socket_path,
+        &[
+            "pane",
+            "send-text",
+            "--expect-terminal",
+            &terminal_id,
+            &pane_id,
+            "printf 'ACCEPTED_%s\\n' EXPECT",
+        ],
+    );
+    assert!(
+        accepted.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&accepted.stderr)
+    );
+    let entered = run_cli(
+        &socket_path,
+        &[
+            "pane",
+            "send-keys",
+            "--expect-terminal",
+            &terminal_id,
+            &pane_id,
+            "enter",
+        ],
+    );
+    assert!(
+        entered.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&entered.stderr)
+    );
+    let waited = run_cli(
+        &socket_path,
+        &[
+            "pane",
+            "wait-output",
+            &pane_id,
+            "--match",
+            "ACCEPTED_EXPECT",
+            "--source",
+            "recent",
+            "--timeout",
+            "5000",
+        ],
+    );
+    assert!(
+        waited.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&waited.stderr)
+    );
+
+    let read = run_cli(
+        &socket_path,
+        &[
+            "pane", "read", &pane_id, "--source", "recent", "--lines", "80",
+        ],
+    );
+    assert!(read.status.success());
+    let text = String::from_utf8(read.stdout).unwrap();
+    assert!(
+        !text.contains("REFUSED_MARKER"),
+        "refused text reached the pane: {text}"
+    );
+
+    cleanup_spawned_herdr(herdr, base);
+}

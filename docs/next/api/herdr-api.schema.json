@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "protocol": 19,
+  "protocol": 20,
   "schema_version": 1,
   "schemas": {
     "error_response": {
@@ -1224,6 +1224,16 @@
       "$defs": {
         "AgentPromptParams": {
           "properties": {
+            "expect": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/request/$defs/InputExpectation"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "target": {
               "type": "string"
             },
@@ -1316,6 +1326,16 @@
         },
         "AgentSendKeysParams": {
           "properties": {
+            "expect": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/request/$defs/InputExpectation"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "keys": {
               "items": {
                 "type": "string"
@@ -2090,6 +2110,20 @@
           "required": [
             "match_event"
           ],
+          "type": "object"
+        },
+        "InputExpectation": {
+          "additionalProperties": false,
+          "description": "Optional precondition for input requests (`pane.send_text`,\n`pane.send_keys`, `agent.prompt`, `agent.send_keys`).\n\nWhen present, the server compares every set field against the pane it\nresolved from the request target and refuses the request with\n`expectation_failed`, writing nothing, if any field differs. Every field is\noptional so later fields can be added without breaking older clients; an\nobject that sets no field is rejected (`invalid_expectation`) rather than\ntreated as \"no precondition\". Unknown fields are rejected too, so a newer\nclient that adds a field gets an error from this server instead of having\nthe field silently ignored. Clients must confirm the server advertises the\n`input-expect` feature in `ping` before sending `expect` at all, because\nservers that predate it silently ignore unknown params.",
+          "properties": {
+            "terminal_id": {
+              "description": "Terminal id the resolved pane must currently host, as reported by\n`pane.get`/`pane.list` (`terminal_id`) and `agent.get`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
           "type": "object"
         },
         "IntegrationInstallParams": {
@@ -2992,6 +3026,16 @@
         },
         "PaneSendKeysParams": {
           "properties": {
+            "expect": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/request/$defs/InputExpectation"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "keys": {
               "items": {
                 "type": "string"
@@ -3010,6 +3054,16 @@
         },
         "PaneSendTextParams": {
           "properties": {
+            "expect": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/request/$defs/InputExpectation"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "pane_id": {
               "type": "string"
             },
@@ -8573,6 +8627,14 @@
                     }
                   ],
                   "default": null
+                },
+                "features": {
+                  "default": [],
+                  "description": "Additive API features this server implements, for example\n`input-expect`. Absent from servers that predate the list.",
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
                 },
                 "protocol": {
                   "format": "uint32",

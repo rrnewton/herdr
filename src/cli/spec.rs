@@ -327,6 +327,8 @@ fn agent_command() -> Command {
         .subcommand(
             Command::new("send-keys")
                 .about("Send key presses to an agent")
+                .override_usage("herdr agent send-keys [--expect-terminal <TERMINAL_ID>] <TARGET> <KEY>...")
+                .arg(option("expect-terminal", "TERMINAL_ID").help("Refuse with expectation_failed, writing nothing, unless the target pane currently hosts this terminal id (from pane get / agent get). Give it before the positional arguments"))
                 .arg(required("target", "TARGET"))
                 .arg(required("key", "KEY").num_args(1..))
                 .after_help("Use esc as the canonical Escape key name; escape is also accepted."),
@@ -334,7 +336,8 @@ fn agent_command() -> Command {
         .subcommand(
             Command::new("prompt")
                 .about("Submit a prompt to an agent")
-                .override_usage("herdr agent prompt <TARGET> <TEXT> [OPTIONS]")
+                .override_usage("herdr agent prompt [--expect-terminal <TERMINAL_ID>] <TARGET> <TEXT> [OPTIONS]")
+                .arg(option("expect-terminal", "TERMINAL_ID").help("Refuse with expectation_failed, writing nothing, unless the target pane currently hosts this terminal id (from agent get / pane get). Accepted before the positional arguments or among the options"))
                 .arg(required("target", "TARGET"))
                 .arg(required("text", "TEXT"))
                 .arg(
@@ -564,6 +567,8 @@ fn pane_command() -> Command {
         .subcommand(
             Command::new("send-text")
                 .about("Send literal text to a pane")
+                .override_usage("herdr pane send-text [--expect-terminal <TERMINAL_ID>] <PANE_ID> <TEXT>")
+                .arg(option("expect-terminal", "TERMINAL_ID").help("Refuse with expectation_failed, writing nothing, unless the target pane currently hosts this terminal id (from pane get / agent get). Give it before the positional arguments"))
                 .arg(required("pane_id", "PANE_ID"))
                 .arg(required("text", "TEXT"))
                 .after_help(
@@ -573,6 +578,8 @@ fn pane_command() -> Command {
         .subcommand(
             Command::new("send-keys")
                 .about("Send key presses to a pane")
+                .override_usage("herdr pane send-keys [--expect-terminal <TERMINAL_ID>] <PANE_ID> <KEY>...")
+                .arg(option("expect-terminal", "TERMINAL_ID").help("Refuse with expectation_failed, writing nothing, unless the target pane currently hosts this terminal id (from pane get / agent get). Give it before the positional arguments"))
                 .arg(required("pane_id", "PANE_ID"))
                 .arg(required("key", "KEY").num_args(1..))
                 .after_help("Use esc as the canonical Escape key name; escape is also accepted."),

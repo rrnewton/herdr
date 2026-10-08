@@ -13,7 +13,14 @@ use serde::{Deserialize, Serialize};
 // ---------------------------------------------------------------------------
 
 /// Current protocol version. Bumped when wire format changes incompatibly.
-pub const PROTOCOL_VERSION: u32 = 19;
+///
+/// Fork-local note: 20 here is this fork's protocol (v0.8.0's 19 plus the
+/// `input-expect` API feature: an optional `expect` object on input requests
+/// and a `features` list in `ping`). It is NOT upstream herdr's protocol 20,
+/// which means something different (upstream master is already past it), so
+/// clients must detect conditional input through the `input-expect` feature,
+/// never through this number.
+pub const PROTOCOL_VERSION: u32 = 20;
 
 /// Maximum allowed frame payload size (2 MB). Frames larger than this are
 /// rejected to prevent denial-of-service via oversized length prefixes.

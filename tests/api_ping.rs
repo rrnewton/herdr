@@ -304,7 +304,13 @@ fn ping_over_socket_returns_version() {
     assert_eq!(value["result"]["version"], env!("CARGO_PKG_VERSION"));
     // Intentionally hardcoded so wire protocol bumps require updating this test.
     // Changing this value means old clients/servers are no longer compatible.
-    assert_eq!(value["result"]["protocol"], 19);
+    assert_eq!(value["result"]["protocol"], 20);
+    // Fork-local protocol 20 advertises conditional input explicitly;
+    // clients gate `expect` on this feature, not on the protocol number.
+    assert_eq!(
+        value["result"]["features"],
+        serde_json::json!(["input-expect"])
+    );
 
     cleanup_spawned_herdr(child, base);
 }

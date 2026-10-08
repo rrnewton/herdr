@@ -25,7 +25,7 @@ use super::super::api_helpers::{
 };
 #[cfg(test)]
 use super::super::api_helpers::{METADATA_SOURCE_MAX_CHARS, METADATA_TTL_MAX_MS};
-use super::responses::{encode_error, encode_success};
+use super::responses::{encode_error, encode_error_body, encode_success};
 
 impl App {
     pub(super) fn handle_pane_split(&mut self, id: String, params: PaneSplitParams) -> String {
@@ -1484,6 +1484,13 @@ impl App {
         let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
+        // Conditional input: checked in this same handler call, before any
+        // write; see `input_expect` for why that is atomic.
+        if let Err(error) =
+            self.check_input_expectation(ws_idx, pane_id, &params.pane_id, params.expect.as_ref())
+        {
+            return encode_error_body(id, error);
+        }
         let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
@@ -1600,6 +1607,13 @@ impl App {
         let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
+        // Conditional input: checked in this same handler call, before any
+        // write; see `input_expect` for why that is atomic.
+        if let Err(error) =
+            self.check_input_expectation(ws_idx, pane_id, &params.pane_id, params.expect.as_ref())
+        {
+            return encode_error_body(id, error);
+        }
         let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
@@ -1965,6 +1979,7 @@ mod tests {
                     "ctrl+k".into(),
                     "ctrl+l".into(),
                 ],
+                expect: None,
             }),
         });
 
@@ -2036,6 +2051,7 @@ mod tests {
             method: crate::api::schema::Method::PaneSendKeys(PaneSendKeysParams {
                 pane_id,
                 keys: vec!["C-c".into(), "c-c".into(), "ctrl+c".into()],
+                expect: None,
             }),
         });
 
@@ -2057,6 +2073,7 @@ mod tests {
             method: crate::api::schema::Method::PaneSendKeys(PaneSendKeysParams {
                 pane_id,
                 keys: vec!["+".into()],
+                expect: None,
             }),
         });
 
@@ -2086,6 +2103,7 @@ mod tests {
             method: crate::api::schema::Method::PaneSendKeys(PaneSendKeysParams {
                 pane_id,
                 keys: vec!["shift+?".into()],
+                expect: None,
             }),
         });
 
@@ -2151,6 +2169,7 @@ mod tests {
             method: crate::api::schema::Method::PaneSendKeys(PaneSendKeysParams {
                 pane_id,
                 keys: vec!["ctrl+h".into(), "not-a-key".into()],
+                expect: None,
             }),
         });
 
@@ -2158,6 +2177,154 @@ mod tests {
         assert_eq!(error.error.code, "invalid_key");
         assert_eq!(error.error.message, "unsupported key not-a-key");
         assert!(rx.try_recv().is_err());
+    }
+
+    fn root_terminal_id(app: &App) -> String {
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        app.state
+            .terminal_id_for_pane(0, pane_id)
+            .unwrap()
+            .to_string()
+    }
+
+    /// Simulate the pane id surviving while its terminal is replaced (for
+    /// example a restart that restores a pane under the same public id).
+    /// The test runtime stays attached to the pane, so without the
+    /// expectation check the write would reach it.
+    fn replace_root_terminal(app: &mut App) -> String {
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let replacement = crate::terminal::TerminalId::alloc();
+        app.state.workspaces[0].tabs[0]
+            .panes
+            .get_mut(&pane_id)
+            .unwrap()
+            .attached_terminal_id = replacement.clone();
+        app.state.ensure_test_terminals();
+        replacement.to_string()
+    }
+
+    fn api_request_json(app: &mut App, json: serde_json::Value) -> String {
+        let request: crate::api::schema::Request = serde_json::from_value(json).unwrap();
+        app.handle_api_request(request)
+    }
+
+    #[tokio::test]
+    async fn api_pane_send_text_with_matching_expect_writes() {
+        let (mut app, pane_id, mut rx) = app_with_send_key_runtime(4);
+        let terminal_id = root_terminal_id(&app);
+
+        let response = api_request_json(
+            &mut app,
+            serde_json::json!({
+                "id": "req",
+                "method": "pane.send_text",
+                "params": {"pane_id": pane_id, "text": "hello", "expect": {"terminal_id": terminal_id}},
+            }),
+        );
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(success.result, ResponseResult::Ok {});
+        assert_eq!(rx.try_recv().unwrap(), bytes::Bytes::from_static(b"hello"));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn api_pane_send_text_with_stale_expect_refuses_and_writes_nothing() {
+        let (mut app, pane_id, mut rx) = app_with_send_key_runtime(4);
+        let stale_terminal_id = root_terminal_id(&app);
+        let replacement_terminal_id = replace_root_terminal(&mut app);
+
+        let response = api_request_json(
+            &mut app,
+            serde_json::json!({
+                "id": "req",
+                "method": "pane.send_text",
+                "params": {"pane_id": pane_id, "text": "rm -rf build", "expect": {"terminal_id": stale_terminal_id}},
+            }),
+        );
+
+        assert!(
+            response.contains(r#""code":"expectation_failed""#),
+            "{response}"
+        );
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.id, "req");
+        assert_eq!(error.error.code, "expectation_failed");
+        assert!(error.error.message.contains(&stale_terminal_id));
+        assert!(error.error.message.contains(&replacement_terminal_id));
+        assert!(rx.try_recv().is_err(), "refused send must write nothing");
+    }
+
+    #[tokio::test]
+    async fn api_pane_send_text_without_expect_is_unchanged() {
+        let (mut app, pane_id, mut rx) = app_with_send_key_runtime(4);
+        replace_root_terminal(&mut app);
+
+        let response = api_request_json(
+            &mut app,
+            serde_json::json!({
+                "id": "req",
+                "method": "pane.send_text",
+                "params": {"pane_id": pane_id, "text": "hello"},
+            }),
+        );
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(success.result, ResponseResult::Ok {});
+        assert_eq!(rx.try_recv().unwrap(), bytes::Bytes::from_static(b"hello"));
+    }
+
+    #[tokio::test]
+    async fn api_pane_send_text_rejects_empty_expect_without_writing() {
+        let (mut app, pane_id, mut rx) = app_with_send_key_runtime(4);
+
+        let response = api_request_json(
+            &mut app,
+            serde_json::json!({
+                "id": "req",
+                "method": "pane.send_text",
+                "params": {"pane_id": pane_id, "text": "hello", "expect": {}},
+            }),
+        );
+
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "invalid_expectation");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn api_pane_send_keys_honors_expect() {
+        let (mut app, pane_id, mut rx) = app_with_send_key_runtime(4);
+        let terminal_id = root_terminal_id(&app);
+
+        let matched = app.handle_api_request(crate::api::schema::Request {
+            id: "req-match".into(),
+            method: crate::api::schema::Method::PaneSendKeys(PaneSendKeysParams {
+                pane_id: pane_id.clone(),
+                keys: vec!["enter".into()],
+                expect: Some(crate::api::schema::InputExpectation {
+                    terminal_id: Some(terminal_id.clone()),
+                }),
+            }),
+        });
+        let success: SuccessResponse = serde_json::from_str(&matched).unwrap();
+        assert_eq!(success.result, ResponseResult::Ok {});
+        assert_eq!(rx.try_recv().unwrap(), bytes::Bytes::from_static(b"\r"));
+
+        replace_root_terminal(&mut app);
+        let refused = app.handle_api_request(crate::api::schema::Request {
+            id: "req-stale".into(),
+            method: crate::api::schema::Method::PaneSendKeys(PaneSendKeysParams {
+                pane_id,
+                keys: vec!["ctrl+c".into(), "enter".into()],
+                expect: Some(crate::api::schema::InputExpectation {
+                    terminal_id: Some(terminal_id),
+                }),
+            }),
+        });
+        let error: ErrorResponse = serde_json::from_str(&refused).unwrap();
+        assert_eq!(error.error.code, "expectation_failed");
+        assert!(rx.try_recv().is_err(), "refused send must write nothing");
     }
 
     #[tokio::test]
