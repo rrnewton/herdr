@@ -47,6 +47,10 @@ pub enum ResponseResult {
         protocol: u32,
         #[serde(default)]
         capabilities: Option<ServerCapabilities>,
+        /// Additive API features this server implements, for example
+        /// `input-expect`. Absent from servers that predate the list.
+        #[serde(default)]
+        features: Vec<String>,
     },
     SessionSnapshot {
         snapshot: Box<SessionSnapshot>,

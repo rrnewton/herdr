@@ -75,6 +75,7 @@ enum ServerRuntimeStatus {
         version: Option<String>,
         protocol: Option<u32>,
         capabilities: Option<crate::api::schema::ServerCapabilities>,
+        features: Vec<String>,
     },
     NotRunning,
 }
@@ -135,20 +136,34 @@ fn print_client_status(json: bool) -> std::io::Result<()> {
 }
 
 fn print_server_status_body(server: &ServerRuntimeStatus, indent: &str) {
+    print!("{}", server_status_body_text(server, indent));
+}
+
+fn server_status_body_text(server: &ServerRuntimeStatus, indent: &str) -> String {
+    let socket = api::socket_path();
     match server {
         ServerRuntimeStatus::Running {
-            version, protocol, ..
-        } => {
-            println!("{indent}status: running");
-            println!("{indent}version: {}", option_label(version.as_deref()));
-            println!("{indent}protocol: {}", protocol_label(*protocol));
-            println!("{indent}compatible: {}", compatibility_label(*protocol));
-            println!("{indent}socket: {}", api::socket_path().display());
-        }
-        ServerRuntimeStatus::NotRunning => {
-            println!("{indent}status: not running");
-            println!("{indent}socket: {}", api::socket_path().display());
-        }
+            version,
+            protocol,
+            features,
+            ..
+        } => format!(
+            "{indent}status: running\n\
+             {indent}version: {}\n\
+             {indent}protocol: {}\n\
+             {indent}capabilities: {}\n\
+             {indent}compatible: {}\n\
+             {indent}socket: {}\n",
+            option_label(version.as_deref()),
+            protocol_label(*protocol),
+            features_label(features),
+            compatibility_label(*protocol),
+            socket.display(),
+        ),
+        ServerRuntimeStatus::NotRunning => format!(
+            "{indent}status: not running\n{indent}socket: {}\n",
+            socket.display()
+        ),
     }
 }
 
@@ -158,6 +173,7 @@ fn read_server_runtime_status() -> std::io::Result<ServerRuntimeStatus> {
             version: status.version,
             protocol: status.protocol,
             capabilities: status.capabilities,
+            features: status.features,
         }),
         Err(ApiClientError::Io(err)) if super::server_not_running_error(&err) => {
             Ok(ServerRuntimeStatus::NotRunning)
@@ -175,6 +191,17 @@ fn api_client_error_to_io(err: ApiClientError) -> std::io::Error {
 
 fn option_label(value: Option<&str>) -> &str {
     value.unwrap_or("unknown")
+}
+
+/// Server API features as one space-separated line, e.g. `input-expect`;
+/// `none` for servers that report no features (including servers that predate
+/// the feature list).
+fn features_label(features: &[String]) -> String {
+    if features.is_empty() {
+        "none".to_string()
+    } else {
+        features.join(" ")
+    }
 }
 
 fn protocol_label(protocol: Option<u32>) -> String {
@@ -225,6 +252,7 @@ struct ServerStatusJson {
     version: Option<String>,
     protocol: Option<u32>,
     capabilities: Option<ServerCapabilitiesJson>,
+    features: Vec<String>,
     compatible: Option<bool>,
     socket: String,
     session: Option<String>,
@@ -258,6 +286,7 @@ fn server_status_json(server: &ServerRuntimeStatus) -> ServerStatusJson {
             version,
             protocol,
             capabilities,
+            features,
         } => ServerStatusJson {
             status: "running",
             running: true,
@@ -269,6 +298,7 @@ fn server_status_json(server: &ServerRuntimeStatus) -> ServerStatusJson {
                     live_handoff: capabilities.live_handoff,
                     detached_server_daemon: capabilities.detached_server_daemon,
                 }),
+            features: features.clone(),
             compatible: protocol.map(|value| value == crate::protocol::PROTOCOL_VERSION),
             socket: api::socket_path().display().to_string(),
             session: crate::session::active_name(),
@@ -280,6 +310,7 @@ fn server_status_json(server: &ServerRuntimeStatus) -> ServerStatusJson {
             version: None,
             protocol: None,
             capabilities: None,
+            features: Vec::new(),
             compatible: None,
             socket: api::socket_path().display().to_string(),
             session: crate::session::active_name(),
@@ -321,4 +352,48 @@ fn print_status_help() {
     eprintln!("  herdr status [--json]         show local client and running server status");
     eprintln!("  herdr status server [--json]  show running server status");
     eprintln!("  herdr status client [--json]  show local client binary status");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn running(features: Vec<String>) -> ServerRuntimeStatus {
+        ServerRuntimeStatus::Running {
+            version: Some("0.8.0".into()),
+            protocol: Some(crate::protocol::PROTOCOL_VERSION),
+            capabilities: None,
+            features,
+        }
+    }
+
+    #[test]
+    fn server_status_text_lists_capabilities_line() {
+        let text = server_status_body_text(&running(crate::api::schema::server_features()), "");
+        assert!(
+            text.lines()
+                .any(|line| line == "capabilities: input-expect"),
+            "missing capabilities line: {text}"
+        );
+        let indented =
+            server_status_body_text(&running(crate::api::schema::server_features()), "  ");
+        assert!(indented
+            .lines()
+            .any(|line| line == "  capabilities: input-expect"));
+
+        let old_server = server_status_body_text(&running(Vec::new()), "");
+        assert!(old_server.lines().any(|line| line == "capabilities: none"));
+        let not_running = server_status_body_text(&ServerRuntimeStatus::NotRunning, "");
+        assert!(!not_running.contains("capabilities:"));
+    }
+
+    #[test]
+    fn server_status_json_reports_features() {
+        let json = serde_json::to_value(server_status_json(&running(vec!["input-expect".into()])))
+            .unwrap();
+        assert_eq!(json["features"], serde_json::json!(["input-expect"]));
+        let json =
+            serde_json::to_value(server_status_json(&ServerRuntimeStatus::NotRunning)).unwrap();
+        assert_eq!(json["features"], serde_json::json!([]));
+    }
 }

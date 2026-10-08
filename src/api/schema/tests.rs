@@ -87,6 +87,7 @@ fn agent_start_and_prompt_requests_round_trip() {
             target: "reviewer".into(),
             text: "review this".into(),
             wait: None,
+            expect: None,
         }),
     };
     let prompt_json = serde_json::to_value(&prompt).unwrap();
@@ -105,6 +106,7 @@ fn agent_start_and_prompt_requests_round_trip() {
                 until: vec![AgentStatus::Idle, AgentStatus::Done],
                 timeout_ms: Some(120_000),
             }),
+            expect: None,
         }),
     };
     let prompt_and_wait_json = serde_json::to_value(&prompt_and_wait).unwrap();
@@ -354,6 +356,107 @@ fn missing_required_params_are_rejected() {
         .unwrap_err()
         .to_string();
     assert!(err.contains("text"));
+}
+
+#[test]
+fn input_params_round_trip_with_and_without_expect() {
+    let expect = Some(InputExpectation {
+        terminal_id: Some("term_abc".into()),
+    });
+    let requests = [
+        Method::PaneSendText(PaneSendTextParams {
+            pane_id: "p_1".into(),
+            text: "hello".into(),
+            expect: expect.clone(),
+        }),
+        Method::PaneSendKeys(PaneSendKeysParams {
+            pane_id: "p_1".into(),
+            keys: vec!["enter".into()],
+            expect: expect.clone(),
+        }),
+        Method::AgentPrompt(AgentPromptParams {
+            target: "reviewer".into(),
+            text: "hello".into(),
+            wait: None,
+            expect: expect.clone(),
+        }),
+        Method::AgentSendKeys(AgentSendKeysParams {
+            target: "reviewer".into(),
+            keys: vec!["esc".into()],
+            expect: expect.clone(),
+        }),
+    ];
+    for method in requests {
+        let request = Request {
+            id: "req_expect".into(),
+            method,
+        };
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            json["params"]["expect"],
+            serde_json::json!({"terminal_id": "term_abc"})
+        );
+        let restored: Request = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(restored, request);
+
+        // Without `expect` the wire shape is exactly the pre-expect shape.
+        let mut without = json;
+        without["params"].as_object_mut().unwrap().remove("expect");
+        let restored: Request = serde_json::from_value(without.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&restored).unwrap(), without);
+        let params = serde_json::to_value(&restored).unwrap()["params"].clone();
+        assert!(params.get("expect").is_none());
+    }
+}
+
+#[test]
+fn input_params_without_expect_parse_as_none() {
+    let json = r#"{"id":"req_1","method":"pane.send_text","params":{"pane_id":"p_1","text":"hi"}}"#;
+    let request: Request = serde_json::from_str(json).unwrap();
+    assert_eq!(
+        request.method,
+        Method::PaneSendText(PaneSendTextParams {
+            pane_id: "p_1".into(),
+            text: "hi".into(),
+            expect: None,
+        })
+    );
+}
+
+#[test]
+fn input_expectation_rejects_unknown_fields() {
+    let json = r#"{"id":"req_1","method":"agent.send_keys","params":{"target":"reviewer","keys":["esc"],"expect":{"terminal_id":"term_abc","process":"codex"}}}"#;
+    let err = serde_json::from_str::<Request>(json)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("unknown field"), "{err}");
+}
+
+#[test]
+fn pong_features_round_trip_and_default_for_older_servers() {
+    let response = SuccessResponse {
+        id: "req_1".into(),
+        result: ResponseResult::Pong {
+            version: "0.8.0".into(),
+            protocol: crate::protocol::PROTOCOL_VERSION,
+            capabilities: None,
+            features: server_features(),
+        },
+    };
+    let json = serde_json::to_value(&response).unwrap();
+    assert_eq!(
+        json["result"]["features"],
+        serde_json::json!(["input-expect"])
+    );
+    let restored: SuccessResponse = serde_json::from_value(json).unwrap();
+    assert_eq!(restored, response);
+
+    let older = r#"{"id":"req_1","result":{"type":"pong","version":"0.8.0","protocol":19,"capabilities":{"live_handoff":true}}}"#;
+    let older: SuccessResponse = serde_json::from_str(older).unwrap();
+    let ResponseResult::Pong { features, .. } = older.result else {
+        panic!("expected pong");
+    };
+    assert!(features.is_empty());
 }
 
 #[test]
@@ -641,6 +744,7 @@ fn success_response_round_trips() {
                 live_handoff: true,
                 detached_server_daemon: true,
             }),
+            features: Vec::new(),
         },
     };
 

@@ -67,6 +67,17 @@ impl App {
             Ok(resolved) => resolved,
             Err(err) => return encode_error_body(id, self.agent_target_error_body(err)),
         };
+        // Conditional input: checked in this same handler call, before the
+        // submission write (with or without `wait`; the server-side wait
+        // dispatches this handler for the submission); see `input_expect`.
+        if let Err(error) = self.check_input_expectation(
+            resolved.ws_idx,
+            resolved.pane_id,
+            &params.target,
+            params.expect.as_ref(),
+        ) {
+            return encode_error_body(id, error);
+        }
         let Some(terminal_id) = self
             .state
             .workspaces
@@ -231,6 +242,16 @@ impl App {
             Ok(resolved) => resolved,
             Err(err) => return encode_error_body(id, self.agent_target_error_body(err)),
         };
+        // Conditional input: checked in this same handler call, before any
+        // write; see `input_expect` for why that is atomic.
+        if let Err(error) = self.check_input_expectation(
+            resolved.ws_idx,
+            resolved.pane_id,
+            &params.target,
+            params.expect.as_ref(),
+        ) {
+            return encode_error_body(id, error);
+        }
         let Some(terminal_id) = self
             .state
             .workspaces
@@ -337,6 +358,7 @@ mod tests {
                 target: public_pane_id,
                 text: "A != B".into(),
                 wait: None,
+                expect: None,
             },
         );
         let success: SuccessResponse = serde_json::from_str(&response).unwrap();
@@ -368,6 +390,7 @@ mod tests {
                 target: "reviewer".into(),
                 text: "A != B".into(),
                 wait: None,
+                expect: None,
             },
         );
         let raw: SuccessResponse = serde_json::from_str(&raw).unwrap();
@@ -389,6 +412,7 @@ mod tests {
                 target: "opencode".into(),
                 text: "wrong target".into(),
                 wait: None,
+                expect: None,
             },
         );
         let error: crate::api::schema::ErrorResponse = serde_json::from_str(&rejected).unwrap();
@@ -414,6 +438,7 @@ mod tests {
             AgentSendKeysParams {
                 target: "reviewer".into(),
                 keys: vec!["enter".into(), "not-a-key".into()],
+                expect: None,
             },
         );
         let error: crate::api::schema::ErrorResponse = serde_json::from_str(&rejected).unwrap();
@@ -425,12 +450,141 @@ mod tests {
             AgentSendKeysParams {
                 target: "reviewer".into(),
                 keys: vec!["up".into(), "enter".into()],
+                expect: None,
             },
         );
         let success: SuccessResponse = serde_json::from_str(&sent).unwrap();
         assert!(matches!(success.result, ResponseResult::Ok {}));
         assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"\x1b[A\r"));
         assert!(rx.try_recv().is_err());
+    }
+
+    /// Named agent "reviewer" in the root pane with a capturing runtime.
+    /// Returns the receiver and the pane's current terminal id.
+    fn app_with_named_agent_runtime() -> (
+        App,
+        crate::layout::PaneId,
+        tokio::sync::mpsc::Receiver<Bytes>,
+        String,
+    ) {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_agent_name("reviewer".into());
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+        let (runtime, rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.state.insert_test_runtime(pane_id, runtime);
+        (app, pane_id, rx, terminal_id.to_string())
+    }
+
+    fn expect_terminal(terminal_id: &str) -> Option<crate::api::schema::InputExpectation> {
+        Some(crate::api::schema::InputExpectation {
+            terminal_id: Some(terminal_id.into()),
+        })
+    }
+
+    #[tokio::test]
+    async fn agent_prompt_with_matching_expect_submits() {
+        let (mut app, _pane_id, mut rx, terminal_id) = app_with_named_agent_runtime();
+
+        let response = app.handle_agent_prompt(
+            "req".into(),
+            AgentPromptParams {
+                target: "reviewer".into(),
+                text: "hello".into(),
+                wait: None,
+                expect: expect_terminal(&terminal_id),
+            },
+        );
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(
+            success.result,
+            ResponseResult::AgentPrompted { .. }
+        ));
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"hello"));
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            Bytes::from_static(b"\r")
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_prompt_with_stale_expect_refuses_and_writes_nothing() {
+        let (mut app, pane_id, mut rx, terminal_id) = app_with_named_agent_runtime();
+
+        let response = app.handle_agent_prompt(
+            "req".into(),
+            AgentPromptParams {
+                target: app.public_pane_id(0, pane_id).unwrap(),
+                text: "hello".into(),
+                wait: Some(crate::api::schema::AgentPromptWaitOptions {
+                    until: Vec::new(),
+                    timeout_ms: None,
+                }),
+                expect: expect_terminal("term_stale"),
+            },
+        );
+
+        let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "expectation_failed");
+        assert!(error.error.message.contains("term_stale"));
+        assert!(error.error.message.contains(&terminal_id));
+        assert!(rx.try_recv().is_err());
+        // The delayed Enter must not follow either.
+        assert!(
+            tokio::time::timeout(AGENT_PROMPT_SUBMIT_DELAY * 2, rx.recv())
+                .await
+                .is_err(),
+            "refused prompt must not schedule Enter"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_send_keys_honors_expect() {
+        let (mut app, _pane_id, mut rx, terminal_id) = app_with_named_agent_runtime();
+
+        let refused = app.handle_agent_send_keys(
+            "req-stale".into(),
+            AgentSendKeysParams {
+                target: "reviewer".into(),
+                keys: vec!["ctrl+c".into()],
+                expect: expect_terminal("term_stale"),
+            },
+        );
+        let error: crate::api::schema::ErrorResponse = serde_json::from_str(&refused).unwrap();
+        assert_eq!(error.error.code, "expectation_failed");
+        assert!(rx.try_recv().is_err());
+
+        let sent = app.handle_agent_send_keys(
+            "req-match".into(),
+            AgentSendKeysParams {
+                target: "reviewer".into(),
+                keys: vec!["esc".into()],
+                expect: expect_terminal(&terminal_id),
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&sent).unwrap();
+        assert!(matches!(success.result, ResponseResult::Ok {}));
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"\x1b"));
+
+        let unconditional = app.handle_agent_send_keys(
+            "req-none".into(),
+            AgentSendKeysParams {
+                target: "reviewer".into(),
+                keys: vec!["enter".into()],
+                expect: None,
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&unconditional).unwrap();
+        assert!(matches!(success.result, ResponseResult::Ok {}));
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"\r"));
     }
 
     #[tokio::test]
@@ -459,6 +613,7 @@ mod tests {
                 target: "reviewer".into(),
                 text: "A != B".into(),
                 wait: None,
+                expect: None,
             },
         );
         let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();

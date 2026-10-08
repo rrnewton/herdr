@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Added
+- Added conditional input: `pane.send_text`, `pane.send_keys`, `agent.prompt`, and `agent.send_keys` accept `expect: {terminal_id}` (CLI `--expect-terminal`) and refuse a replaced pane with `expectation_failed` without writing. Servers advertise it as `input-expect` in the new `ping` `features` list, shown by `herdr status server` as `capabilities: input-expect`. This fork-local protocol 20 is not upstream protocol 20.
+
 ## [0.8.0] - 2026-08-03
 
 ### Added

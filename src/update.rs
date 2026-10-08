@@ -2687,6 +2687,7 @@ mod tests {
             version: Some("0.5.5".to_string()),
             protocol: Some(2),
             capabilities: None,
+            features: Vec::new(),
         };
         let compatible_release = ReleaseInfo {
             version: Version::parse("0.5.6").unwrap(),
@@ -2744,6 +2745,7 @@ mod tests {
                     live_handoff: true,
                     detached_server_daemon: true,
                 }),
+                features: Vec::new(),
             },
         };
 
@@ -2929,6 +2931,7 @@ mod tests {
             version: Some("0.5.5".to_string()),
             protocol: Some(2),
             capabilities: None,
+            features: Vec::new(),
         };
         let release = ReleaseInfo {
             version: Version::parse("0.5.6").unwrap(),

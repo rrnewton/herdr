@@ -6,7 +6,9 @@ pub(crate) const PANE_GRAPHICS_SET_MAX_BYTES: usize = 512 * 1024;
 pub(crate) const PANE_GRAPHICS_STREAM_MAX_BYTES: usize = 16 * 1024 * 1024;
 
 use super::agents::AgentSessionInfo;
-use super::common::{AgentStatus, PaneAgentState, ReadFormat, ReadSource, SplitDirection};
+use super::common::{
+    AgentStatus, InputExpectation, PaneAgentState, ReadFormat, ReadSource, SplitDirection,
+};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PaneSplitParams {
@@ -231,12 +233,16 @@ pub struct PaneRenameParams {
 pub struct PaneSendTextParams {
     pub pane_id: String,
     pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expect: Option<InputExpectation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PaneSendKeysParams {
     pub pane_id: String,
     pub keys: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expect: Option<InputExpectation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

@@ -193,3 +193,4 @@ After that failed read, ask the agent to write its complete response as Markdown
 - Never run `herdr server stop` from an active session unless the user explicitly intends to stop the server and its pane processes.
 - Never kill the main Herdr process. Use named test sessions for experiments that need an isolated server.
 - CLI server errors are JSON on stderr with exit status 1. CLI syntax errors exit with status 2.
+- To make input conditional on the pane still hosting the terminal you inspected, pass `--expect-terminal <terminal_id>` (from `pane get` / `agent get`) before the target of `pane send-text`, `pane send-keys`, `agent prompt`, or `agent send-keys`. A replaced pane is refused with `expectation_failed` and receives nothing. Only use it when `herdr status server` lists `capabilities: input-expect`.

@@ -159,3 +159,29 @@ pub enum AgentStatus {
 pub(crate) fn default_true() -> bool {
     true
 }
+
+/// Stable error code returned when an input request carries an `expect`
+/// object that does not match the resolved target.
+pub const EXPECTATION_FAILED_ERROR_CODE: &str = "expectation_failed";
+
+/// Optional precondition for input requests (`pane.send_text`,
+/// `pane.send_keys`, `agent.prompt`, `agent.send_keys`).
+///
+/// When present, the server compares every set field against the pane it
+/// resolved from the request target and refuses the request with
+/// `expectation_failed`, writing nothing, if any field differs. Every field is
+/// optional so later fields can be added without breaking older clients; an
+/// object that sets no field is rejected (`invalid_expectation`) rather than
+/// treated as "no precondition". Unknown fields are rejected too, so a newer
+/// client that adds a field gets an error from this server instead of having
+/// the field silently ignored. Clients must confirm the server advertises the
+/// `input-expect` feature in `ping` before sending `expect` at all, because
+/// servers that predate it silently ignore unknown params.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct InputExpectation {
+    /// Terminal id the resolved pane must currently host, as reported by
+    /// `pane.get`/`pane.list` (`terminal_id`) and `agent.get`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_id: Option<String>,
+}

@@ -294,6 +294,10 @@ fn subcommand_help_explains_automation_semantics_without_a_server() {
             &["pane", "send-keys", "--help"],
             "canonical Escape key name",
         ),
+        (&["pane", "send-text", "--help"], "--expect-terminal"),
+        (&["pane", "send-keys", "--help"], "expectation_failed"),
+        (&["agent", "prompt", "--help"], "--expect-terminal"),
+        (&["agent", "send-keys", "--help"], "expectation_failed"),
     ];
 
     for (args, expected) in cases {

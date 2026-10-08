@@ -4,8 +4,8 @@ use serde::Serialize;
 
 use crate::api::client::{ApiClient, ApiClientError};
 use crate::api::schema::{
-    AgentStatus, ClientWindowTitleSetParams, EmptyParams, Method, PaneAgentState, ReadFormat,
-    ReadSource, Request, SplitDirection,
+    AgentStatus, ClientWindowTitleSetParams, EmptyParams, InputExpectation, Method, PaneAgentState,
+    ReadFormat, ReadSource, Request, SplitDirection,
 };
 
 mod agent;
@@ -842,6 +842,55 @@ pub(super) fn normalize_tab_id(value: &str) -> String {
 
 pub(super) fn normalize_pane_id(value: &str) -> String {
     value.to_string()
+}
+
+/// CLI flag for the conditional-input precondition (`expect.terminal_id`).
+pub(super) const EXPECT_TERMINAL_FLAG: &str = "--expect-terminal";
+
+/// Recognize `--expect-terminal <ID>` or `--expect-terminal=<ID>` at
+/// `args[index]`. Returns the terminal id and how many args it consumed, or
+/// `None` when `args[index]` is not that flag.
+pub(super) fn parse_expect_terminal_at(
+    args: &[String],
+    index: usize,
+) -> Option<Result<(String, usize), String>> {
+    let arg = args.get(index)?;
+    let (value, consumed) = if arg == EXPECT_TERMINAL_FLAG {
+        match args.get(index + 1) {
+            Some(value) => (value.clone(), 2),
+            None => return Some(Err(format!("missing value for {EXPECT_TERMINAL_FLAG}"))),
+        }
+    } else {
+        let value = arg.strip_prefix(EXPECT_TERMINAL_FLAG)?.strip_prefix('=')?;
+        (value.to_string(), 1)
+    };
+    if value.is_empty() {
+        return Some(Err(format!(
+            "{EXPECT_TERMINAL_FLAG} requires a terminal id"
+        )));
+    }
+    Some(Ok((value, consumed)))
+}
+
+/// Split leading `--expect-terminal` options off an input command's
+/// arguments. Only options *before* the positional arguments are recognized,
+/// so positional text or keys that themselves start with `--` stay literal.
+pub(super) fn split_leading_expect_terminal(
+    args: &[String],
+) -> Result<(Option<InputExpectation>, &[String]), String> {
+    let mut expect = None;
+    let mut index = 0;
+    while let Some(parsed) = parse_expect_terminal_at(args, index) {
+        let (terminal_id, consumed) = parsed?;
+        if expect.is_some() {
+            return Err(format!("{EXPECT_TERMINAL_FLAG} may only be given once"));
+        }
+        expect = Some(InputExpectation {
+            terminal_id: Some(terminal_id),
+        });
+        index += consumed;
+    }
+    Ok((expect, &args[index..]))
 }
 
 pub(super) fn parse_split_direction(value: &str) -> std::io::Result<SplitDirection> {

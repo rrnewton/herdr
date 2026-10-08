@@ -898,26 +898,55 @@ fn pane_close(args: &[String]) -> std::io::Result<i32> {
     super::runtime::pane_close(super::normalize_pane_id(raw_pane_id))
 }
 
-fn pane_send_text(args: &[String]) -> std::io::Result<i32> {
-    if args.len() < 2 {
-        eprintln!("usage: herdr pane send-text <pane_id> <text>");
-        return Ok(2);
-    }
+const PANE_SEND_TEXT_USAGE: &str =
+    "usage: herdr pane send-text [--expect-terminal TERMINAL_ID] <pane_id> <text>";
+const PANE_SEND_KEYS_USAGE: &str =
+    "usage: herdr pane send-keys [--expect-terminal TERMINAL_ID] <pane_id> <key> [key ...]";
 
-    let pane_id = super::normalize_pane_id(&args[0]);
-    let text = args[1..].join(" ");
-    super::send_ok_request(Method::PaneSendText(PaneSendTextParams { pane_id, text }))
+fn pane_send_text(args: &[String]) -> std::io::Result<i32> {
+    let params = match parse_pane_send_text_args(args) {
+        Ok(params) => params,
+        Err(err) => {
+            eprintln!("{err}");
+            return Ok(2);
+        }
+    };
+    super::send_ok_request(Method::PaneSendText(params))
+}
+
+fn parse_pane_send_text_args(args: &[String]) -> Result<PaneSendTextParams, String> {
+    let (expect, rest) = super::split_leading_expect_terminal(args)?;
+    if rest.len() < 2 {
+        return Err(PANE_SEND_TEXT_USAGE.to_string());
+    }
+    Ok(PaneSendTextParams {
+        pane_id: super::normalize_pane_id(&rest[0]),
+        text: rest[1..].join(" "),
+        expect,
+    })
 }
 
 fn pane_send_keys(args: &[String]) -> std::io::Result<i32> {
-    if args.len() < 2 {
-        eprintln!("usage: herdr pane send-keys <pane_id> <key> [key ...]");
-        return Ok(2);
-    }
+    let params = match parse_pane_send_keys_args(args) {
+        Ok(params) => params,
+        Err(err) => {
+            eprintln!("{err}");
+            return Ok(2);
+        }
+    };
+    super::send_ok_request(Method::PaneSendKeys(params))
+}
 
-    let pane_id = super::normalize_pane_id(&args[0]);
-    let keys = args[1..].to_vec();
-    super::send_ok_request(Method::PaneSendKeys(PaneSendKeysParams { pane_id, keys }))
+fn parse_pane_send_keys_args(args: &[String]) -> Result<PaneSendKeysParams, String> {
+    let (expect, rest) = super::split_leading_expect_terminal(args)?;
+    if rest.len() < 2 {
+        return Err(PANE_SEND_KEYS_USAGE.to_string());
+    }
+    Ok(PaneSendKeysParams {
+        pane_id: super::normalize_pane_id(&rest[0]),
+        keys: rest[1..].to_vec(),
+        expect,
+    })
 }
 
 fn pane_run(args: &[String]) -> std::io::Result<i32> {
@@ -1508,14 +1537,15 @@ fn print_pane_help() {
     eprintln!("  herdr pane move <pane_id> --new-tab [--workspace ID] [--label TEXT] [--focus|--no-focus]");
     eprintln!("  herdr pane move <pane_id> --new-workspace [--label TEXT] [--tab-label TEXT] [--focus|--no-focus]");
     eprintln!("  herdr pane close <pane_id>");
-    eprintln!("  herdr pane send-text <pane_id> <text>");
-    eprintln!("  herdr pane send-keys <pane_id> <key> [key ...]");
+    eprintln!("  herdr pane send-text [--expect-terminal TERMINAL_ID] <pane_id> <text>");
+    eprintln!("  herdr pane send-keys [--expect-terminal TERMINAL_ID] <pane_id> <key> [key ...]");
     eprintln!("  herdr pane wait-output <pane_id> (--match TEXT | --regex PATTERN) [--source visible|recent|recent-unwrapped] [--lines N] [--timeout MS] [--raw]");
     eprintln!("  herdr pane report-agent <pane_id> --source ID --agent LABEL --state idle|working|blocked|unknown [--message TEXT] [--seq N] [--agent-session-id ID] [--agent-session-path PATH]");
     eprintln!("  herdr pane report-agent-session <pane_id> --source ID --agent LABEL [--seq N] [--agent-session-id ID] [--agent-session-path PATH]");
     eprintln!("  herdr pane release-agent <pane_id> --source ID --agent LABEL [--seq N]");
     eprintln!("  herdr pane report-metadata <pane_id> --source ID [--agent LABEL] [--applies-to-source ID] [--title TEXT|--clear-title] [--display-agent TEXT|--clear-display-agent] [--state-label STATUS=TEXT] [--clear-state-labels] [--token NAME=VALUE] [--clear-token NAME] [--seq N] [--ttl-ms N]");
     eprintln!("  herdr pane run <pane_id> <command>");
+    eprintln!("  --expect-terminal refuses the input with expectation_failed, writing nothing, unless the pane hosts that terminal id");
 }
 
 #[cfg(test)]
@@ -1524,6 +1554,79 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    fn expect_terminal(terminal_id: &str) -> Option<crate::api::schema::InputExpectation> {
+        Some(crate::api::schema::InputExpectation {
+            terminal_id: Some(terminal_id.into()),
+        })
+    }
+
+    #[test]
+    fn parse_pane_send_text_args_without_expect_is_unchanged() {
+        let params = parse_pane_send_text_args(&args(&["p_1", "echo", "hi"])).unwrap();
+        assert_eq!(params.pane_id, "p_1");
+        assert_eq!(params.text, "echo hi");
+        assert_eq!(params.expect, None);
+        // Text that starts with `--` stays literal, as before.
+        let params =
+            parse_pane_send_text_args(&args(&["p_1", "--expect-terminal", "term_x"])).unwrap();
+        assert_eq!(params.text, "--expect-terminal term_x");
+        assert_eq!(params.expect, None);
+    }
+
+    #[test]
+    fn parse_pane_send_text_args_accepts_leading_expect_terminal() {
+        let params = parse_pane_send_text_args(&args(&[
+            "--expect-terminal",
+            "term_abc",
+            "p_1",
+            "--not-a-flag",
+            "--wait",
+        ]))
+        .unwrap();
+        assert_eq!(params.pane_id, "p_1");
+        assert_eq!(params.text, "--not-a-flag --wait");
+        assert_eq!(params.expect, expect_terminal("term_abc"));
+
+        let params =
+            parse_pane_send_text_args(&args(&["--expect-terminal=term_abc", "p_1", "--"])).unwrap();
+        assert_eq!(params.text, "--");
+        assert_eq!(params.expect, expect_terminal("term_abc"));
+    }
+
+    #[test]
+    fn parse_pane_send_text_args_rejects_bad_expect_terminal() {
+        assert!(parse_pane_send_text_args(&args(&["--expect-terminal"])).is_err());
+        assert!(parse_pane_send_text_args(&args(&["--expect-terminal=", "p_1", "x"])).is_err());
+        assert!(parse_pane_send_text_args(&args(&["--expect-terminal", "term_a", "p_1"])).is_err());
+        assert!(parse_pane_send_text_args(&args(&[
+            "--expect-terminal",
+            "term_a",
+            "--expect-terminal",
+            "term_b",
+            "p_1",
+            "x"
+        ]))
+        .is_err());
+    }
+
+    #[test]
+    fn parse_pane_send_keys_args_accepts_leading_expect_terminal() {
+        let params = parse_pane_send_keys_args(&args(&[
+            "--expect-terminal",
+            "term_abc",
+            "p_1",
+            "ctrl+c",
+            "enter",
+        ]))
+        .unwrap();
+        assert_eq!(params.pane_id, "p_1");
+        assert_eq!(params.keys, vec!["ctrl+c".to_string(), "enter".to_string()]);
+        assert_eq!(params.expect, expect_terminal("term_abc"));
+
+        let params = parse_pane_send_keys_args(&args(&["p_1", "enter"])).unwrap();
+        assert_eq!(params.expect, None);
     }
 
     #[test]
