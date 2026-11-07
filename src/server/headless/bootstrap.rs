@@ -55,10 +55,7 @@ pub fn run_server() -> io::Result<()> {
         Err(err) => return Err(err),
     };
 
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(io::Error::other)?;
+    let rt = crate::tokio_runtime::build()?;
 
     let result = rt.block_on(async {
         // Create the App (with AppState, event channels, etc.).
@@ -156,10 +153,7 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
         );
     }
 
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(io::Error::other)?;
+    let rt = crate::tokio_runtime::build()?;
 
     let result = rt.block_on(async {
         let app = app::App::new_from_handoff(
