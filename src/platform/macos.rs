@@ -1206,6 +1206,13 @@ pub fn process_exists(pid: u32) -> bool {
     }
 }
 
+/// Pane children are waited for on a blocking thread here; only Linux has the pidfd reaper.
+pub(crate) fn watch_child_exit(
+    _pid: u32,
+) -> Option<tokio::sync::oneshot::Receiver<std::io::Result<std::process::ExitStatus>>> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
