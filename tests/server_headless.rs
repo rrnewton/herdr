@@ -102,7 +102,23 @@ fn spawn_server(
     config_home: &Path,
     runtime_dir: &Path,
     api_socket_path: &Path,
+    client_socket_path: &Path,
+) -> SpawnedHerdr {
+    spawn_server_with_env(
+        config_home,
+        runtime_dir,
+        api_socket_path,
+        client_socket_path,
+        &[],
+    )
+}
+
+fn spawn_server_with_env(
+    config_home: &Path,
+    runtime_dir: &Path,
+    api_socket_path: &Path,
     _client_socket_path: &Path,
+    env: &[(&str, &str)],
 ) -> SpawnedHerdr {
     fs::create_dir_all(config_home.join("herdr")).unwrap();
     fs::create_dir_all(runtime_dir).unwrap();
@@ -131,6 +147,10 @@ fn spawn_server(
     cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", "/bin/sh");
     cmd.env_remove("HERDR_ENV");
+    cmd.env_remove("HERDR_RUNTIME_WORKER_THREADS");
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
 
     let child = pair.slave.spawn_command(cmd).unwrap();
     register_spawned_herdr_pid(child.process_id());
@@ -231,6 +251,116 @@ fn server_api_responds_to_ping() {
     assert!(
         response.contains("pong"),
         "API should respond to ping: {response}"
+    );
+
+    cleanup_spawned_herdr(spawned, base);
+}
+
+fn api_request(socket_path: &Path, request: &str) -> serde_json::Value {
+    let mut stream = UnixStream::connect(socket_path).expect("should connect to API socket");
+    writeln!(stream, "{request}").unwrap();
+    let mut response = String::new();
+    BufReader::new(stream).read_line(&mut response).unwrap();
+    serde_json::from_str(&response).expect("response should be valid JSON")
+}
+
+/// The server's threads by kind, from /proc: `(tokio, watchers, pty)`, where `watchers` are the tokio
+/// blocking threads waiting for a pane's child (wait4) and `pty` the per-pane terminal readers.
+#[cfg(target_os = "linux")]
+fn server_threads(pid: u32) -> (usize, usize, usize) {
+    const WAIT4: &str = "61";
+    let (mut tokio, mut watchers, mut pty) = (0, 0, 0);
+    for task in fs::read_dir(format!("/proc/{pid}/task")).unwrap().flatten() {
+        let name = fs::read_to_string(task.path().join("comm")).unwrap_or_default();
+        if name.trim() == "tokio-rt-worker" {
+            tokio += 1;
+            let syscall = fs::read_to_string(task.path().join("syscall")).unwrap_or_default();
+            if syscall.split_whitespace().next() == Some(WAIT4) {
+                watchers += 1;
+            }
+        } else if name.starts_with("herdr-pty") {
+            pty += 1;
+        }
+    }
+    (tokio, watchers, pty)
+}
+
+/// The runtime starts the configured number of workers, not one per CPU, so the server's tokio
+/// threads are those workers, one child watcher per live pane, and at most a few idle blocking
+/// threads; closing a pane gives its watcher back.
+#[cfg(target_os = "linux")]
+#[test]
+fn server_threads_are_bounded_workers_plus_per_pane_threads() {
+    const WORKERS: usize = 3;
+    const IDLE_BLOCKING_SLACK: usize = 4;
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+    let workers = WORKERS.to_string();
+    let spawned = spawn_server_with_env(
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        &client_socket,
+        &[("HERDR_RUNTIME_WORKER_THREADS", &workers)],
+    );
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    let pid = spawned.child.process_id().expect("server pid");
+
+    let settled = |panes: usize| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let (tokio, watchers, pty) = server_threads(pid);
+            if (watchers, pty) == (panes, panes) || Instant::now() > deadline {
+                return (tokio, watchers, pty);
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    };
+    let (_, before, _) = settled(server_threads(pid).2);
+    let mut workspaces = Vec::new();
+    for index in 0..4 {
+        let created = api_request(
+            &api_socket,
+            &format!(
+                r#"{{"id":"w{index}","method":"workspace.create","params":{{"label":"threads-{index}"}}}}"#
+            ),
+        );
+        workspaces.push(
+            created["result"]["workspace"]["workspace_id"]
+                .as_str()
+                .expect("workspace id")
+                .to_owned(),
+        );
+    }
+    let panes = before + 4;
+    let (tokio, watchers, pty) = settled(panes);
+    assert_eq!(
+        (watchers, pty),
+        (panes, panes),
+        "one watcher and one reader per pane"
+    );
+    assert!(
+        tokio >= WORKERS + panes && tokio <= WORKERS + panes + IDLE_BLOCKING_SLACK,
+        "{tokio} tokio threads for {WORKERS} workers and {panes} panes"
+    );
+
+    for workspace_id in workspaces.drain(..2) {
+        api_request(
+            &api_socket,
+            &format!(
+                r#"{{"id":"close","method":"workspace.close","params":{{"workspace_id":"{workspace_id}"}}}}"#
+            ),
+        );
+    }
+    let (_, watchers, pty) = settled(panes - 2);
+    assert_eq!(
+        (watchers, pty),
+        (panes - 2, panes - 2),
+        "closed panes keep no threads"
     );
 
     cleanup_spawned_herdr(spawned, base);
