@@ -97,6 +97,7 @@ mod terminal;
 mod terminal_modes;
 mod terminal_notify;
 mod terminal_theme;
+mod tokio_runtime;
 mod ui;
 mod update;
 mod workspace;
@@ -821,10 +822,7 @@ fn main() -> io::Result<()> {
     // Only checks for newer versions and notifies the TUI.
     // Skipped in --no-session mode (testing).
 
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("failed to create tokio runtime");
+    let rt = tokio_runtime::build().expect("failed to create tokio runtime");
 
     let result = rt.block_on(async {
         let mut terminal = ratatui::init();
