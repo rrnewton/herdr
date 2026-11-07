@@ -277,3 +277,10 @@ pub fn read_clipboard_image() -> Option<ClipboardImage> {
 pub fn show_desktop_notification(_title: &str, _body: Option<&str>) -> std::io::Result<bool> {
     Ok(false)
 }
+
+/// Pane children are waited for on a blocking thread here; only Linux has the pidfd reaper.
+pub(crate) fn watch_child_exit(
+    _pid: u32,
+) -> Option<tokio::sync::oneshot::Receiver<std::io::Result<std::process::ExitStatus>>> {
+    None
+}

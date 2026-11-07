@@ -27,6 +27,8 @@ mod clipboard_tests;
 #[cfg(test)]
 mod config_file_tests;
 
+mod child_reaper;
+pub(crate) use child_reaper::watch_child_exit;
 mod shutdown;
 pub(crate) use shutdown::monitor_host_shutdown;
 mod power;

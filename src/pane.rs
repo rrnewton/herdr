@@ -2740,12 +2740,13 @@ impl PaneRuntime {
             let events = events.clone();
             let rt = tokio::runtime::Handle::current();
             let mut child = spawned.child;
-            if let Some(pid) = child.process_id() {
+            let pid = child.process_id();
+            if let Some(pid) = pid {
                 child_pid.store(pid, Ordering::Release);
                 crate::logging::pane_spawned(pane_id.raw(), pid);
             }
-            tokio::task::spawn_blocking(move || {
-                let exit_reason = match child.wait() {
+            let exited = move |wait: std::io::Result<portable_pty::ExitStatus>| {
+                let exit_reason = match wait {
                     Ok(status) => {
                         let exit_reason = crate::platform::classify_child_exit(&status);
                         let status_text = format!("{status:?}");
@@ -2758,14 +2759,40 @@ impl PaneRuntime {
                     }
                 };
                 child_wait_completed.store(true, Ordering::Release);
-                // Use blocking send — PaneDied is critical, must not be dropped
-                if let Err(e) = rt.block_on(events.send(AppEvent::PaneDied {
-                    pane_id,
-                    exit_reason,
-                })) {
-                    error!(pane = pane_id.raw(), err = %e, "failed to send PaneDied event");
+                (
+                    events,
+                    AppEvent::PaneDied {
+                        pane_id,
+                        exit_reason,
+                    },
+                )
+            };
+            // Where the platform has one, the shared child reaper waits for the shell, so a live
+            // pane holds no blocking-pool thread; otherwise a blocking thread waits for it.
+            match pid.and_then(crate::platform::watch_child_exit) {
+                Some(reaped) => {
+                    tokio::spawn(async move {
+                        let wait = match reaped.await {
+                            Ok(wait) => wait.map(portable_pty::ExitStatus::from),
+                            Err(_) => Err(std::io::Error::other("the child reaper stopped")),
+                        };
+                        let (events, died) = exited(wait);
+                        // PaneDied is critical and must not be dropped: wait for room.
+                        if let Err(e) = events.send(died).await {
+                            error!(pane = pane_id.raw(), err = %e, "failed to send PaneDied event");
+                        }
+                    });
                 }
-            });
+                None => {
+                    tokio::task::spawn_blocking(move || {
+                        let (events, died) = exited(child.wait());
+                        // Use blocking send — PaneDied is critical, must not be dropped
+                        if let Err(e) = rt.block_on(events.send(died)) {
+                            error!(pane = pane_id.raw(), err = %e, "failed to send PaneDied event");
+                        }
+                    });
+                }
+            }
         }
 
         let io = {
